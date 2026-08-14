@@ -36,7 +36,7 @@ class MainWindow(QMainWindow):
         self.config = config or Config.load()
         self.store = store or StatsStore()
         self.setWindowTitle("Guitar Trainer")
-        self.resize(1100, 760)
+        self.resize(1360, 760)
 
         self._session_id: int | None = None
         self._devices = list_input_devices()
