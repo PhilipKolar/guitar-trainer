@@ -216,6 +216,153 @@ class ChordMatcher:
         return [(self.chords[i], float(scores[i])) for i in order]
 
 
+def note_template(pitch_class: int, **kwargs) -> np.ndarray:
+    """Expected chroma for a single ringing note — a harmonic_template of one note.
+
+    Used to tell a genuine chord apart from a single note whose own harmonics happen
+    to land on other chord-tone positions: a major triad's third and fifth *are* the
+    low harmonics of its root, so this needs the same scoring machinery as chord-vs-
+    chord matching, not a cruder single-note-vs-multi-note heuristic.
+    """
+    return harmonic_template((pitch_class,), **kwargs)
+
+
+@dataclass(frozen=True)
+class NoteOrChordMatch:
+    """The result of :meth:`NoteOrChordClassifier.classify`."""
+
+    kind: str  # "note" or "chord"
+    pitch_class: int | None
+    """Set when ``kind == "note"``."""
+    chord: Chord | None
+    """Set when ``kind == "chord"``."""
+    score: float
+
+
+class NoteOrChordClassifier:
+    """Decides whether a chroma vector is better explained as a single ringing note
+    or as a chord.
+
+    This exists because a monophonic pitch tracker (YIN) can look perfectly "stable"
+    even while a chord is ringing — it just locks onto whichever string happens to
+    dominate a given frame, drifting between strings as their relative loudness
+    shifts as they decay. So "YIN currently reports a stable note" is not a reliable
+    signal for "this is actually a single note, not a chord": it will just as
+    confidently claim a strummed E major is "B2" for a while, then jump to another
+    string. Chroma-based classification is what actually distinguishes the two.
+
+    Both candidate types (12 single notes, every chord) are scored with the identical
+    cosine-minus-unexplained-energy formula :class:`ChordMatcher` uses, and whichever
+    scores higher wins. Plain cosine similarity against a single-note template alone
+    would not be enough — see the harmonic-overlap note above — but the unexplained-
+    energy penalty is what actually separates them: a real chord's chroma carries
+    energy on its other tones from their *own* fundamentals, well beyond what one
+    root's harmonic decay alone would predict, so a single-note template leaves much
+    more of a real chord's chroma "unexplained" than the true chord template does.
+    Validated against real single notes and real chord voicings — E major
+    specifically, the case most likely to be confused — in
+    tests/test_chords.py::TestNoteOrChordClassifier.
+    """
+
+    def __init__(
+        self,
+        chords=None,
+        *,
+        unexplained_penalty: float = UNEXPLAINED_PENALTY,
+        support_threshold: float = SUPPORT_THRESHOLD,
+        root_bonus: float = 0.06,
+    ) -> None:
+        self._chord_matcher = ChordMatcher(
+            chords,
+            root_bonus=root_bonus,
+            unexplained_penalty=unexplained_penalty,
+            support_threshold=support_threshold,
+        )
+        self._note_templates = np.array([note_template(pc) for pc in range(12)])
+        peaks = self._note_templates.max(axis=1, keepdims=True)
+        self._note_unsupported = self._note_templates < support_threshold * peaks
+        self._unexplained_penalty = unexplained_penalty
+
+    def classify(
+        self, chroma: np.ndarray, bass_pitch_class: int | None = None
+    ) -> NoteOrChordMatch | None:
+        norm = np.linalg.norm(chroma)
+        if norm <= 0:
+            return None
+        unit = chroma / norm
+
+        note_scores = self._note_templates @ unit
+        if self._unexplained_penalty:
+            unexplained = np.linalg.norm(unit * self._note_unsupported, axis=1)
+            note_scores = note_scores - self._unexplained_penalty * unexplained
+        best_note_pc = int(np.argmax(note_scores))
+        best_note_score = float(note_scores[best_note_pc])
+
+        chord_match = self._chord_matcher.match(chroma, bass_pitch_class)
+        chord_score = chord_match.score if chord_match is not None else -np.inf
+
+        if chord_match is not None and chord_score > best_note_score:
+            return NoteOrChordMatch("chord", None, chord_match.chord, chord_score)
+        return NoteOrChordMatch("note", best_note_pc, None, best_note_score)
+
+
+class NoteOrChordGate:
+    """Accepts a note-or-chord classification only once it has held steadily.
+
+    Mirrors :class:`ChordGate`, generalised over the "note" vs "chord" outcomes a
+    :class:`NoteOrChordClassifier` produces.
+    """
+
+    def __init__(
+        self,
+        classifier: NoteOrChordClassifier,
+        *,
+        min_score: float = 0.35,
+        stable_frames: int = 3,
+    ) -> None:
+        self.classifier = classifier
+        self.min_score = min_score
+        self.stable_frames = stable_frames
+        self._streak = 0
+        self._candidate_key: tuple | None = None
+        self._current: NoteOrChordMatch | None = None
+
+    @property
+    def current(self) -> NoteOrChordMatch | None:
+        return self._current
+
+    def reset(self) -> None:
+        self._streak = 0
+        self._candidate_key = None
+        self._current = None
+
+    def push(
+        self, chroma: np.ndarray | None, bass_pitch_class: int | None = None
+    ) -> NoteOrChordMatch | None:
+        if chroma is None:
+            self.reset()
+            return None
+
+        match = self.classifier.classify(chroma, bass_pitch_class)
+        if match is None or match.score < self.min_score:
+            self.reset()
+            return None
+
+        key = (match.kind, match.pitch_class if match.kind == "note" else match.chord)
+        if key == self._candidate_key:
+            self._streak += 1
+        else:
+            self._candidate_key = key
+            self._streak = 1
+
+        if self._streak >= self.stable_frames:
+            self._current = match
+            return match
+
+        self._current = None
+        return None
+
+
 class ChordGate:
     """Accepts a chord only once it has been held steadily.
 

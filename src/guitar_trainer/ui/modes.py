@@ -30,7 +30,16 @@ from PySide6.QtWidgets import (
 
 from ..audio.metronome import MAX_BPM, MIN_BPM, BeatCounter, Metronome
 from ..audio.pitch import PitchSmoother
-from ..core.chords import CHORD_QUALITIES, QUALITY_SUFFIX, Chord, ChordGate, ChordMatcher, all_chords
+from ..core.chords import (
+    CHORD_QUALITIES,
+    QUALITY_SUFFIX,
+    Chord,
+    ChordGate,
+    ChordMatcher,
+    NoteOrChordClassifier,
+    NoteOrChordGate,
+    all_chords,
+)
 from ..core.notes import (
     ALL_NOTES,
     NATURAL_NOTES,
@@ -202,18 +211,22 @@ class TunerPanel(ModePanel):
 class FreeDetectPanel(ModePanel):
     """Live readout of whatever is being played — a single note, or a chord.
 
-    Both detection streams run all the time; which one is shown is decided by whether a
-    single note is currently ringing cleanly. A held note's chroma still has leakage
-    onto its fifth and third from string harmonics, which can look enough like a chord
-    to the matcher that showing both at once would be more confusing than useful — so
-    a clean single note always wins, and the chord path only speaks once it's gone
-    quiet on the monophonic side.
+    Both detection streams run all the time. Which one is shown is decided by a
+    chroma-based classifier (`NoteOrChordClassifier`), not by whether the monophonic
+    pitch tracker currently looks stable — a strummed chord routinely *does* look
+    stable to YIN, since it just locks onto whichever string momentarily dominates a
+    given frame, drifting between strings as they decay. Gating chord detection behind
+    "no stable note detected" (an earlier version of this panel) meant a real chord
+    could go the length of a strum without ever being classified, while the note
+    readout flickered between whichever string YIN happened to be tracking. See
+    AGENTS.md and NoteOrChordClassifier's docstring for why chroma is the reliable
+    signal here.
     """
 
-    #: Chord matching runs against every chord, since there's no drilled set to narrow
-    #: it to here — see AGENTS.md on why that makes it inherently more error-prone than
-    #: chord practice mode. Kept as an honest best-effort informational display.
-    _CHORD_MATCHER = ChordMatcher(all_chords())
+    #: Runs against every chord, since there's no drilled set to narrow it to here —
+    #: see AGENTS.md on why that makes it inherently more error-prone than chord
+    #: practice mode. Kept as an honest best-effort informational display.
+    _CLASSIFIER = NoteOrChordClassifier(all_chords())
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -242,10 +255,12 @@ class FreeDetectPanel(ModePanel):
         layout.addWidget(self.history)
 
         self._recent: list[str] = []
-        self._note_active = False
         self._bass: int | None = None
-        self._chord_gate = ChordGate(self._CHORD_MATCHER)
+        self._gate = NoteOrChordGate(self._CLASSIFIER)
         self._smoother = PitchSmoother()
+        #: Latest settled classification ("note" / "chord" / None). Only "chord"
+        #: actually suppresses anything — see on_pitch/on_note_stable below.
+        self._chroma_kind: str | None = None
 
         # Both the note and chord readouts share one hold timer: whichever last had
         # something to show keeps showing it briefly after the signal drops out,
@@ -259,7 +274,7 @@ class FreeDetectPanel(ModePanel):
         if not self.active:
             return
         result = self._smoother.push(result)
-        if result is None:
+        if result is None or self._chroma_kind == "chord":
             return
         self._hold_timer.start(METER_HOLD_MS)
         self.meter.set_cents(result.cents)
@@ -269,10 +284,11 @@ class FreeDetectPanel(ModePanel):
         )
 
     def on_note_stable(self, result) -> None:
-        if not self.active:
+        if not self.active or self._chroma_kind == "chord":
+            # Chroma evidence currently says this is part of a chord (a dominant
+            # string within a strum can otherwise look YIN-stable on its own); don't
+            # let that override the chord display with a misleading single note.
             return
-        self._note_active = True
-        self._chord_gate.reset()
         self._hold_timer.start(METER_HOLD_MS)
         self.note_label.show_text(result.name, theme.DETECTED)
         self.highlight_requested.emit(result.pitch_class)
@@ -280,22 +296,20 @@ class FreeDetectPanel(ModePanel):
         self._append_history(result.note_only)
 
     def on_note_released(self) -> None:
-        if not self.active:
-            return
-        # Only flips the note/chord arbitration flag immediately, so chord matching
-        # can resume promptly; the visible readout is left to the hold timer, same as
-        # a decaying chord or a quiet frame from on_pitch.
-        self._note_active = False
+        pass  # the hold timer governs when the display actually clears
 
     def on_bass(self, pitch_class) -> None:
         self._bass = pitch_class
 
     def on_chroma(self, chroma) -> None:
-        if not self.active or self._note_active:
+        if not self.active:
             return
-        match = self._chord_gate.push(chroma, self._bass)
+        match = self._gate.push(chroma, self._bass)
         if match is None:
             return
+        self._chroma_kind = match.kind
+        if match.kind != "chord":
+            return  # a settled "note" just lifts the suppression above; YIN draws it
         self._hold_timer.start(METER_HOLD_MS)
         self.note_label.show_text(match.chord.name(), theme.TARGET)
         self.detail.setText(f"Chord — {match.score:.0%} match")
@@ -317,8 +331,8 @@ class FreeDetectPanel(ModePanel):
 
     def on_deactivated(self) -> None:
         super().on_deactivated()
-        self._note_active = False
-        self._chord_gate.reset()
+        self._chroma_kind = None
+        self._gate.reset()
         self._smoother.reset()
         self._hold_timer.stop()
         self._clear_display()

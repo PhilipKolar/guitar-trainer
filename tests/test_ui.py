@@ -20,6 +20,7 @@ from guitar_trainer.core.notes import (  # noqa: E402
     STANDARD,
     midi_to_freq,
     name_to_midi,
+    name_to_pitch_class,
 )
 from guitar_trainer.core.stats import StatsStore  # noqa: E402
 from guitar_trainer.ui.fretboard import FretboardWidget, LabelMode  # noqa: E402
@@ -261,14 +262,17 @@ class TestFreeDetectPanel:
         panel._clear_display()  # simulate the hold timer firing, without the wait
         assert panel.note_label.text() == "—"
 
-    def test_release_allows_chord_detection_to_resume_immediately(self, qapp):
-        """The arbitration flag must flip right away even though the visible display
-        is held — otherwise a chord strummed right after a note would be ignored."""
+    def test_chord_detection_works_right_after_a_note(self, qapp):
+        """Chord matching must never be gated behind note state — a chord strummed
+        immediately after a single note has to be recognised, not ignored."""
         panel = FreeDetectPanel()
         panel.on_activated()
         panel.on_note_stable(pitch(name_to_midi("A4")))
         panel.on_note_released()
-        assert panel._note_active is False
+        chroma = harmonic_template(Chord.parse("Am").pitch_classes)
+        for _ in range(3):
+            panel.on_chroma(chroma)
+        assert panel.note_label.text() == "Am"
 
     def test_history_deduplicates_repeats(self, qapp):
         panel = FreeDetectPanel()
@@ -330,21 +334,35 @@ class TestFreeDetectPanel:
         panel = FreeDetectPanel()
         panel.on_activated()
         for symbol, bass in [("C", 0), ("Am", 9)]:
-            panel._chord_gate.reset()
+            panel._gate.reset()
             chroma = harmonic_template(Chord.parse(symbol).pitch_classes)
             panel.on_bass(bass)
             for _ in range(3):
                 result = panel.on_chroma(chroma)
             assert panel.note_label.text() == symbol
 
-    def test_a_ringing_single_note_suppresses_chord_display(self, qapp):
-        """A held note's harmonic leakage can look chord-ish; the clean monophonic
-        read must win rather than being second-guessed by the chroma path."""
+    def test_a_note_that_genuinely_sounds_like_a_chord_is_shown_as_a_chord(self, qapp):
+        """The behaviour this replaced: the old design let a YIN-stable single note
+        block chord detection outright, which is exactly why a strummed E major was
+        never recognised — YIN happily locks onto one dominant string mid-strum.
+        If the chroma genuinely says "chord", that must win regardless of what the
+        monophonic tracker reported a moment earlier."""
         panel = FreeDetectPanel()
         panel.on_activated()
         panel.on_note_stable(pitch(name_to_midi("E3")))
         chroma = harmonic_template(Chord.parse("Am").pitch_classes)
-        for _ in range(5):
+        for _ in range(3):
+            panel.on_chroma(chroma)
+        assert panel.note_label.text() == "Am"
+
+    def test_a_single_notes_own_chroma_does_not_get_reclassified_as_a_chord(self, qapp):
+        """The flip side: real chroma evidence that agrees it's just one note must
+        not spuriously override the note display."""
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("E3")))
+        chroma = harmonic_template((name_to_pitch_class("E"),))
+        for _ in range(3):
             panel.on_chroma(chroma)
         assert panel.note_label.text() == "E3"
 

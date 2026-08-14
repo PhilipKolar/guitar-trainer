@@ -8,10 +8,13 @@ from guitar_trainer.core.chords import (
     Chord,
     ChordGate,
     ChordMatcher,
+    NoteOrChordClassifier,
+    NoteOrChordGate,
     all_chords,
     harmonic_template,
+    note_template,
 )
-from guitar_trainer.core.notes import name_to_midi, name_to_pitch_class
+from guitar_trainer.core.notes import midi_to_freq, name_to_midi, name_to_pitch_class
 
 SR = synth.SAMPLE_RATE
 
@@ -45,6 +48,19 @@ def chroma_of(voicing_names, **kwargs):
     # Feed several hops, as the worker does, so the median smoothing is exercised.
     result = None
     for start in range(4096, len(audio) - CHROMA_WINDOW, 2048):
+        out = analyser.analyse(audio[start : start + CHROMA_WINDOW])
+        if out is not None:
+            result = out
+    assert result is not None, "no chroma produced"
+    return result
+
+
+def chroma_of_note(midi: int, **kwargs) -> np.ndarray:
+    """Synthesise a single plucked note and return its chroma vector."""
+    audio = synth.plucked_string(midi_to_freq(midi), duration=0.6, attack_noise=0.05, **kwargs)
+    analyser = ChromaAnalyser(SR)
+    result = None
+    for start in range(2048, len(audio) - CHROMA_WINDOW, 1024):
         out = analyser.analyse(audio[start : start + CHROMA_WINDOW])
         if out is not None:
             result = out
@@ -243,3 +259,157 @@ class TestChordGate:
 
 def _common():
     return [Chord(name_to_pitch_class(root), quality) for root, quality in COMMON_OPEN_CHORDS]
+
+
+class TestNoteTemplate:
+    def test_normalised(self):
+        assert np.linalg.norm(note_template(0)) == pytest.approx(1.0)
+
+    def test_peaks_on_the_root(self):
+        assert int(np.argmax(note_template(4))) == 4  # E
+
+    def test_root_weight_has_no_effect_on_a_single_note(self):
+        """root_weight scales the (only) note uniformly; normalising removes it."""
+        default = note_template(0)
+        heavier = note_template(0, root_weight=5.0)
+        np.testing.assert_allclose(default, heavier, atol=1e-10)
+
+
+class TestNoteOrChordClassifier:
+    """The fix for chord detection never triggering in Free Detect.
+
+    A monophonic pitch tracker can look "stable" on a single dominant string even
+    while a full chord is ringing, so gating chord detection behind "no stable note
+    is currently detected" (the old design) meant a strummed chord routinely never
+    got a chance to be classified at all. This class decides note-vs-chord from the
+    chroma vector itself instead, which is what actually distinguishes the two.
+    """
+
+    @pytest.mark.parametrize(
+        "note", ["E2", "A2", "D3", "G3", "B3", "E4", "A4", "C4", "E3", "G2", "B2"]
+    )
+    def test_single_notes_are_classified_as_notes(self, note):
+        midi = name_to_midi(note)
+        chroma = chroma_of_note(midi)
+        classifier = NoteOrChordClassifier(all_chords())
+        match = classifier.classify(chroma)
+        assert match is not None
+        assert match.kind == "note", (
+            f"{note} misclassified as a chord (score {match.score:.3f})"
+        )
+        assert match.pitch_class == midi % 12
+
+    @pytest.mark.parametrize("symbol", [s for s in VOICINGS if s != "E5"])
+    def test_chord_voicings_are_classified_as_chords(self, symbol):
+        chroma = chroma_of(VOICINGS[symbol])
+        classifier = NoteOrChordClassifier(all_chords())
+        match = classifier.classify(chroma)
+        assert match is not None
+        assert match.kind == "chord", (
+            f"{symbol} misclassified as a single note (score {match.score:.3f})"
+        )
+        assert match.chord == Chord.parse(symbol)
+
+    def test_power_chords_are_an_inherent_ambiguity_not_a_bug(self):
+        """A power chord is just a root and its own 3rd harmonic (mod octave) played
+        as a second string — chroma-wise that's indistinguishable from a single note
+        with a strong 3rd harmonic, since it's literally the same energy pattern.
+        There is no principled fix for this from chroma alone; it's fine either way."""
+        chroma = chroma_of(VOICINGS["E5"])
+        classifier = NoteOrChordClassifier(all_chords())
+        match = classifier.classify(chroma)
+        assert match is not None
+        assert match.kind in ("note", "chord")
+
+    def test_e_major_specifically(self):
+        """The reported bug: E major's notes are exactly the low harmonics of its
+        root (3rd harmonic = a 5th, 5th harmonic = a major 3rd), which is what made
+        the old note-blocks-chord design fail here specifically and consistently."""
+        chroma = chroma_of(VOICINGS["E"])
+        classifier = NoteOrChordClassifier(all_chords())
+        match = classifier.classify(chroma)
+        assert match is not None
+        assert match.kind == "chord"
+        assert match.chord == Chord.parse("E")
+
+    def test_a_single_low_e_string_is_not_mistaken_for_a_chord(self):
+        """The specific single-note case the bug report described being misread."""
+        chroma = chroma_of_note(name_to_midi("B2"))
+        classifier = NoteOrChordClassifier(all_chords())
+        match = classifier.classify(chroma)
+        assert match is not None
+        assert match.kind == "note"
+        assert match.pitch_class == name_to_pitch_class("B")
+
+    def test_silence_returns_none(self):
+        classifier = NoteOrChordClassifier(all_chords())
+        assert classifier.classify(np.zeros(12)) is None
+
+    def test_bass_note_still_disambiguates_relative_pairs(self):
+        classifier = NoteOrChordClassifier(all_chords())
+        for symbol, bass in [("C", "C"), ("Am", "A")]:
+            match = classifier.classify(
+                chroma_of(VOICINGS[symbol]), bass_pitch_class=name_to_pitch_class(bass)
+            )
+            assert match is not None
+            assert match.kind == "chord"
+            assert match.chord == Chord.parse(symbol)
+
+
+class TestNoteOrChordGate:
+    def make(self, **kwargs):
+        return NoteOrChordGate(NoteOrChordClassifier(all_chords()), **kwargs)
+
+    def test_requires_consecutive_agreement(self):
+        gate = self.make(stable_frames=3)
+        chroma = chroma_of(VOICINGS["E"])
+        assert gate.push(chroma) is None
+        assert gate.push(chroma) is None
+        match = gate.push(chroma)
+        assert match is not None
+        assert match.kind == "chord" and match.chord == Chord.parse("E")
+
+    def test_note_settles_too(self):
+        gate = self.make(stable_frames=3)
+        chroma = chroma_of_note(name_to_midi("A2"))
+        gate.push(chroma)
+        gate.push(chroma)
+        match = gate.push(chroma)
+        assert match is not None
+        assert match.kind == "note" and match.pitch_class == name_to_pitch_class("A")
+
+    def test_switching_from_note_to_chord_restarts_the_streak(self):
+        gate = self.make(stable_frames=3)
+        note = chroma_of_note(name_to_midi("E2"))
+        chord = chroma_of(VOICINGS["E"])
+        gate.push(note)
+        gate.push(note)
+        gate.push(chord)  # different kind, must not inherit the note's streak
+        assert gate.current is None
+
+    def test_a_dominant_string_mid_strum_does_not_incorrectly_settle_as_a_note(self):
+        """Regression test for the actual bug: even if a couple of frames early in a
+        strum look note-like before the full chord is established, the gate must not
+        latch onto that transient reading and lock out the chord."""
+        gate = self.make(stable_frames=3)
+        note_ish = chroma_of_note(name_to_midi("E2"))
+        chord = chroma_of(VOICINGS["E"])
+        gate.push(note_ish)
+        gate.push(chord)
+        gate.push(chord)
+        match = gate.push(chord)
+        assert match is not None
+        assert match.kind == "chord"
+
+    def test_none_resets(self):
+        gate = self.make(stable_frames=2)
+        chroma = chroma_of(VOICINGS["E"])
+        gate.push(chroma)
+        gate.push(chroma)
+        assert gate.current is not None
+        assert gate.push(None) is None
+        assert gate.current is None
+
+    def test_weak_match_rejected(self):
+        gate = self.make(min_score=0.99, stable_frames=1)
+        assert gate.push(chroma_of(VOICINGS["E"])) is None

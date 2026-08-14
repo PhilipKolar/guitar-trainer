@@ -21,7 +21,7 @@ The five modes:
 | Mode | What it does |
 |---|---|
 | Tuner | Nearest open string plus a cents needle. |
-| Free detect | Live note *or* chord readout — a clean single note wins if one is ringing, otherwise a sustained chord match is shown. Lights up matching fretboard positions either way. |
+| Free detect | Live note *or* chord readout, decided by a chroma-based classifier (not by whether YIN currently looks stable — see the design decision on this). Lights up matching fretboard positions either way. |
 | Note practice | Prompts a random note; **any octave counts**. |
 | Chord practice | Prompts a random chord from a user-selected set; any voicing counts. |
 | Stats | Accuracy and median response time per note/chord, weakest first. |
@@ -145,7 +145,34 @@ compare them against pre-penalty thresholds.
 **Chord practice restricts the matcher to the selected chords.** Scoring against only
 what is being drilled removes most near-misses — nothing can be mistaken for a chord
 that is not in the exercise. Full 120-chord matching is inherently harder (Cmaj7
-contains Em; Am7 contains C) and is only used where the candidate set is unknown.
+contains Em; Am7 contains C) and is only used where the candidate set is unknown, as
+in Free Detect.
+
+**Free Detect's note-vs-chord arbitration is chroma-driven, not YIN-driven — this was
+a real bug, not a tuning gap.** The original design set an "active note" flag whenever
+`NoteGate` reported a stable monophonic pitch, and used that flag to block chord
+matching outright. That is unreliable input: a monophonic pitch tracker will happily
+report a "stable note" while a full chord rings, because it just locks onto whichever
+string momentarily dominates a given frame and drifts to a different string as they
+decay — so a strummed E major routinely got read as "B2" or similar, never as a chord,
+because *some* string was always looking YIN-stable. `NoteOrChordClassifier` fixes this
+by scoring **both** candidate types (12 single notes, every chord) with the identical
+cosine-minus-unexplained-energy formula `ChordMatcher` already uses, and letting
+whichever scores higher decide. This matters because a major triad's third and fifth
+*are* the low harmonics of its root (3rd harmonic = a 5th up, 5th harmonic = a major
+3rd up), so plain cosine similarity against a single-note template alone cannot rule
+out a chord — E major is exactly the case that would be ambiguous without the
+unexplained-energy penalty, and it's the case that was reported broken. Validated on
+real single notes and real chord voicings, including a full end-to-end synthesised
+E-major strum through the same `ChromaAnalyser` → gate pipeline the app uses (settles
+correctly within ~85ms and stays correct for the whole strum) — see
+`tests/test_chords.py::TestNoteOrChordClassifier`.
+
+One case is an inherent, irresolvable ambiguity, not a bug: a power chord (root +
+fifth only, e.g. E5) is chroma-identical to a single note with a strong 3rd harmonic,
+since the fifth *is* that harmonic. There's no principled fix from chroma alone —
+`test_power_chords_are_an_inherent_ambiguity_not_a_bug` documents this rather than
+asserting either outcome.
 
 **The metronome schedules clicks by sample position, not by timer.** A QTimer at 120
 BPM drifts audibly within a minute or two, which is precisely wrong for a mode whose
@@ -241,10 +268,11 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
 | `METER_HOLD_MS` | 700 | `ui/modes.py` | `test_ui.py` (Tuner/FreeDetect hold tests) |
 | debounced save delay | 400ms | `ui/main_window.py` `_mark_dirty` | `test_ui.py::TestSettingsPersistence` |
+| `NoteOrChordGate` `min_score` | 0.35 (well below both real-note ~0.55-0.93 and real-chord ~0.79-0.88 floors; the *comparison* between the two, not this floor, is what discriminates) | `core/chords.py` | `test_chords.py::TestNoteOrChordClassifier` |
 
 ## Testing
 
-677 tests, ~8 seconds, no audio hardware and no display required.
+719 tests, ~10 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -369,6 +397,13 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   synthetic attempts to the real stats history). The author was told; there's no way
   to recover what was there before. See the new Gotchas entry — always isolate
   `XDG_CONFIG_HOME`/`XDG_DATA_HOME` for anything beyond running the real app.
+- Fixed Free Detect never recognising chords ("played E major heaps of times, it just
+  says B2"). Root cause: chord matching was gated behind a `NoteGate`-derived "is a
+  single note currently stable" flag, and YIN routinely reports exactly that — a
+  stable-looking single note — while a chord is ringing, by locking onto whichever
+  string momentarily dominates. Replaced with `NoteOrChordClassifier` / `NoteOrChordGate`,
+  which decide from the chroma vector itself using the same scoring formula already
+  validated for chord-vs-chord matching. See the design decision above.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -380,8 +415,10 @@ checks that still want a human with an instrument:
    to do it, not just a normal-volume comment.
 2. Tuner: each open string reads correctly, needle centres when in tune; note holds
    briefly (not abruptly) after a string stops ringing.
-3. Free detect: chromatic scale up the low E, then above the 12th fret (octave errors);
-   strum a chord and confirm it's recognised once the note readout goes quiet.
+3. **Free detect chord recognition — the specific bug just fixed.** Strum E major
+   repeatedly and confirm it now reads as a chord promptly and consistently, not as a
+   jumping single note. Also try other open chords, and check a genuinely single note
+   still reads as a note (not misclassified as a chord) across the neck.
 4. Note/chord practice: the Previous/Next preview should feel accurate and useful,
    not distracting; check the fade animation isn't janky on real hardware.
 5. **Rhythm mode at 60 BPM through speakers** — the click should now sound clean, not
