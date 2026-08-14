@@ -3,6 +3,8 @@
 A desktop guitar practice app for Linux. It listens through your microphone, works out what you're
 playing in real time, and drills you on notes and chords.
 
+![Tuner tab, showing the fretboard, note readout and cents needle](screenshot.png)
+
 ## Features
 
 - **Tuner** — per-string cents readout with an in-tune indicator.
