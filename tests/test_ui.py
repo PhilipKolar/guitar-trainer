@@ -542,6 +542,35 @@ class TestNotePracticePanel:
         )
         panel.stop_session()
 
+    def test_rhythm_mode_does_not_advance_on_a_correct_answer(self, qapp, config):
+        """The fix: answering correctly must not reset the countdown off-beat —
+        the next prompt only appears once the beat window elapses on its own."""
+        panel = NotePracticePanel(config)
+        panel.on_activated()
+        panel.rhythm_radio.setChecked(True)
+        panel.bpm_spin.setValue(120)
+        panel.beats_spin.setValue(4)
+        panel.start_session()
+
+        challenge = panel.engine.current
+        panel.on_note_stable(pitch(60 + challenge.pitch_class))
+
+        assert panel.engine.correct_count == 1
+        assert panel.engine.current is challenge  # still the same prompt
+        panel.stop_session()
+
+    def test_free_mode_still_advances_immediately(self, qapp, config):
+        panel = NotePracticePanel(config)
+        panel.on_activated()
+        panel.free_radio.setChecked(True)
+        panel.start_session()
+
+        challenge = panel.engine.current
+        panel.on_note_stable(pitch(60 + challenge.pitch_class))
+
+        assert panel.engine.current is not challenge
+        panel.stop_session()
+
 
 class TestChordPracticePanel:
     def test_builds_challenges_from_selection(self, qapp, config):

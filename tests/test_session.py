@@ -365,6 +365,117 @@ class TestSessionEngineRhythmMode:
         assert engine.tick() is None  # clock was reset for the new challenge
 
 
+class TestSessionEngineRhythmModeStaysOnBeat:
+    """advance_on_correct=False: answering early scores immediately but must not let
+    the next challenge outrun the beat grid — the whole point of rhythm mode."""
+
+    def make(self, clock, timeout=2.0):
+        return SessionEngine(
+            picker=ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0)),
+            timeout_seconds=timeout,
+            advance_on_correct=False,
+            clock=clock,
+        )
+
+    def test_correct_answer_scores_immediately(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        clock.advance(0.3)
+        attempt = engine.submit(pitch(60 + challenge.pitch_class))
+        assert attempt is not None
+        assert attempt.outcome is Outcome.CORRECT
+        assert attempt.response_ms == 300
+
+    def test_correct_answer_does_not_advance_the_challenge(self):
+        """This is the fix: previously a correct answer swapped in a new challenge
+        immediately, resetting the timing window off-beat every time."""
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        clock.advance(0.3)
+        engine.submit(pitch(60 + challenge.pitch_class))
+        assert engine.current is challenge
+        assert engine.state is SessionState.LISTENING
+
+    def test_countdown_keeps_running_after_a_correct_answer(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        clock.advance(0.3)
+        engine.submit(pitch(60 + challenge.pitch_class))
+        clock.advance(0.5)
+        # elapsed keeps counting from the original presentation, not from the answer.
+        assert engine.time_remaining == pytest.approx(1.2)
+
+    def test_advances_only_once_the_beat_window_elapses(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        clock.advance(0.3)
+        engine.submit(pitch(60 + challenge.pitch_class))
+
+        clock.advance(1.0)  # still within the 2s window
+        assert engine.tick() is None
+        assert engine.current is challenge
+
+        clock.advance(1.0)  # now past it
+        assert engine.tick() is None  # no *new* attempt — already scored
+        assert engine.current is not challenge
+
+    def test_only_one_attempt_is_recorded_per_round(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        engine.submit(pitch(60 + challenge.pitch_class))
+        clock.advance(2.1)
+        engine.tick()
+        assert engine.total == 1
+        assert engine.attempts[0].outcome is Outcome.CORRECT
+
+    def test_further_input_after_a_correct_answer_is_ignored(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        engine.submit(pitch(60 + challenge.pitch_class))
+        assert engine.submit(pitch(60 + challenge.pitch_class)) is None
+        assert engine.total == 1
+
+    def test_skip_after_a_correct_answer_advances_without_a_second_attempt(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        engine.submit(pitch(60 + challenge.pitch_class))
+        result = engine.skip()
+        assert result is None  # no new attempt recorded
+        assert engine.total == 1
+        assert engine.current is not challenge
+
+    def test_timeout_without_an_answer_still_works_normally(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        clock.advance(2.1)
+        attempt = engine.tick()
+        assert attempt is not None
+        assert attempt.outcome is Outcome.TIMEOUT
+        assert engine.current is not challenge
+
+    def test_next_round_can_be_answered_early_again(self):
+        clock = FakeClock()
+        engine = self.make(clock)
+        challenge = engine.start()
+        engine.submit(pitch(60 + challenge.pitch_class))
+        clock.advance(2.1)
+        engine.tick()
+
+        next_challenge = engine.current
+        clock.advance(0.2)
+        attempt = engine.submit(pitch(60 + next_challenge.pitch_class))
+        assert attempt is not None and attempt.outcome is Outcome.CORRECT
+        assert engine.current is next_challenge  # still hasn't advanced
+
+
 class TestSessionSummary:
     def test_accuracy_and_median(self):
         clock = FakeClock()

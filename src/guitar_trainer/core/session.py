@@ -185,6 +185,10 @@ class SessionEngine:
     picker: ChallengePicker
     timeout_seconds: float | None = None
     """``None`` is free mode — wait as long as it takes."""
+    advance_on_correct: bool = True
+    """Rhythm mode sets this False: a correct answer is still scored the instant it's
+    played, but the next challenge only appears once the beat window naturally
+    elapses — answering quickly must not let the next prompt outrun the metronome."""
 
     clock: Callable[[], float] = time.monotonic
     on_challenge: Callable[[Challenge], None] | None = None
@@ -197,6 +201,9 @@ class SessionEngine:
     resolved, for a "last played" reference alongside the current prompt."""
     attempts: list[Attempt] = field(default_factory=list)
     _started_at: float = 0.0
+    _resolved_this_round: bool = False
+    """Set once the current round has been scored (advance_on_correct=False only);
+    further input is ignored and tick() advances without scoring again."""
 
     # ---------------------------------------------------------------- control
 
@@ -226,6 +233,7 @@ class SessionEngine:
         self.current = self.picker.next()
         self.state = SessionState.LISTENING
         self._started_at = self.clock()
+        self._resolved_this_round = False
         if self.on_challenge:
             self.on_challenge(self.current)
         return self.current
@@ -245,21 +253,34 @@ class SessionEngine:
     # ----------------------------------------------------------------- input
 
     def submit(self, detection, *, label: str | None = None) -> Attempt | None:
-        """Offer a detection. Returns an Attempt if it resolved the challenge.
+        """Offer a detection. Returns an Attempt if it scored the challenge.
 
         Wrong notes are ignored rather than failing the challenge: while hunting for a
         note on the neck you will sound several others on the way, and failing on those
-        would make the mode unusable.
+        would make the mode unusable. Once a round is scored (immediately in free mode,
+        or via a correct answer in rhythm mode — see ``advance_on_correct``), further
+        input for that round is ignored too, so playing the right note again doesn't
+        do anything odd.
         """
         if self.state is not SessionState.LISTENING or self.current is None:
             return None
+        if self._resolved_this_round:
+            return None
         if not self.current.matches(detection):
             return None
-        return self._resolve(Outcome.CORRECT, label)
+        if self.advance_on_correct:
+            return self._resolve(Outcome.CORRECT, label)
+        self._resolved_this_round = True
+        return self._record(Outcome.CORRECT, label)
 
     def skip(self) -> Attempt | None:
-        """Give up on the current challenge and move on."""
+        """Give up on the current challenge and move on immediately."""
         if self.state is not SessionState.LISTENING:
+            return None
+        if self._resolved_this_round:
+            # Already scored correct this round (rhythm mode, answered early); skip
+            # just moves on now rather than recording a second, contradictory result.
+            self._present()
             return None
         return self._resolve(Outcome.SKIPPED, None)
 
@@ -269,9 +290,15 @@ class SessionEngine:
             return None
         if self.elapsed < self.timeout_seconds:
             return None
+        if self._resolved_this_round:
+            # Correctly answered early; the round's already scored, so the beat
+            # window elapsing just presents the next challenge on schedule.
+            self._present()
+            return None
         return self._resolve(Outcome.TIMEOUT, None)
 
-    def _resolve(self, outcome: Outcome, label: str | None) -> Attempt:
+    def _record(self, outcome: Outcome, label: str | None) -> Attempt:
+        """Score the current round without presenting the next challenge."""
         assert self.current is not None
         attempt = Attempt(
             challenge_key=self.current.key,
@@ -283,6 +310,10 @@ class SessionEngine:
         self.attempts.append(attempt)
         if self.on_result:
             self.on_result(attempt)
+        return attempt
+
+    def _resolve(self, outcome: Outcome, label: str | None) -> Attempt:
+        attempt = self._record(outcome, label)
         self._present()
         return attempt
 

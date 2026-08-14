@@ -523,6 +523,9 @@ class PracticePanel(ModePanel):
                 challenges, rng=random.Random(), weight_fn=self.weight_fn
             ),
             timeout_seconds=timeout,
+            # In rhythm mode, answering early must not let challenges outrun the
+            # beat: score immediately, but only advance once the beat window elapses.
+            advance_on_correct=not rhythm,
             on_challenge=self._on_challenge,
             on_result=self._on_result,
         )

@@ -174,6 +174,21 @@ since the fifth *is* that harmonic. There's no principled fix from chroma alone 
 `test_power_chords_are_an_inherent_ambiguity_not_a_bug` documents this rather than
 asserting either outcome.
 
+**Rhythm mode scores a correct answer immediately but doesn't advance until the beat
+window elapses.** `SessionEngine.advance_on_correct=False` (set for rhythm mode only,
+in `PracticePanel.start_session`) is what this controls. Originally a correct answer
+always called `_present()` right away, which reset `_started_at` to the moment you
+happened to answer — meaning the timing window (and the countdown bar, and when the
+next prompt appeared) drifted off the actual beat grid on every round, defeating the
+point of practising *on rhythm*. Now `submit()` records the attempt via `_record()`
+(scores it, fires `on_result`) but only `tick()` — once `elapsed >= timeout_seconds`,
+on its own clock — calls `_present()`. `_resolved_this_round` tracks whether this
+round's already been scored, so `tick()` knows not to log a second (contradictory)
+TIMEOUT attempt for something already answered correctly, and further `submit()`/
+`skip()` calls in the same round are near-no-ops. Free mode is untouched
+(`advance_on_correct` defaults to `True` there) — instant advancement is exactly what
+"take your time" mode wants.
+
 **The metronome schedules clicks by sample position, not by timer.** A QTimer at 120
 BPM drifts audibly within a minute or two, which is precisely wrong for a mode whose
 purpose is keeping time. The output callback writes clicks at exact sample offsets and
@@ -272,7 +287,7 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-719 tests, ~10 seconds, no audio hardware and no display required.
+730 tests, ~10 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -404,6 +419,11 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   string momentarily dominates. Replaced with `NoteOrChordClassifier` / `NoteOrChordGate`,
   which decide from the chroma vector itself using the same scoring formula already
   validated for chord-vs-chord matching. See the design decision above.
+- Fixed rhythm mode advancing to a new challenge (and resetting its timing window)
+  the instant a correct answer was played, which pulled challenge presentation off
+  the actual beat grid every round. `SessionEngine.advance_on_correct=False` now
+  scores the answer immediately but waits for the beat window to elapse before
+  presenting the next prompt. See the design decision above.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -428,6 +448,10 @@ checks that still want a human with an instrument:
    has a real bass-note signal behind it, worth specifically re-checking).
 7. Settings: change a note/chord selection or a toolbar control, quit via Ctrl-C in
    the terminal within a couple seconds, relaunch — it should be remembered.
+8. Rhythm mode: play the correct note/chord well before the beat window ends — the
+   countdown bar should keep depleting at the same steady rate rather than jumping to
+   a fresh full bar, and the next prompt should land on the beat, not the instant you
+   answered.
 
 Ideas, none committed to: per-string practice restriction, scale/arpeggio drills,
 detecting *which* string was played (needs more than a mono signal), PyInstaller
