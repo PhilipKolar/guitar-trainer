@@ -20,7 +20,7 @@ def main() -> int:
     font = QFont(app.font())
     font.setPointSize(theme.BASE_FONT_POINT_SIZE)
     app.setFont(font)
-    app.setStyleSheet(theme.STYLESHEET)
+    app.setStyleSheet(theme.stylesheet())
 
     window = MainWindow()
     window.show()

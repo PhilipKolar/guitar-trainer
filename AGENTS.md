@@ -306,7 +306,7 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-739 tests, ~10 seconds, no audio hardware and no display required.
+746 tests, ~10 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -327,8 +327,17 @@ fundamentals, inharmonic partials, attack noise.
 **Qt stylesheets override `setFont`.** A `font-size` rule in the app stylesheet
 silently flattens every widget that sets its own font, including the large note and
 prompt readouts. The base size is therefore applied as the *application font* in
-`__main__.py` before the stylesheet, and `theme.STYLESHEET` must not contain
-`font-size`.
+`__main__.py` before the stylesheet, and `theme.stylesheet()`'s returned CSS must not
+contain `font-size` — guarded by `test_theme.py::TestStylesheet::test_does_not_set_a_global_font_size`.
+
+**The QSS border-triangle trick for combo/spin-box arrows doesn't reliably render on
+this build.** The usual zero-size-box-with-transparent-side-borders CSS trick (common
+in QSS dark themes) rendered as a flat bar instead of a triangle here, not the
+intended arrow shape. `theme._ensure_arrow_icons()` draws real triangle PNGs with
+QPainter instead and references them via `image: url(...)`, cached under
+`data_dir()/icons`. If you touch arrow styling again, verify with an actual rendered
+screenshot (`widget.grab()`), not just by reading the QSS — this exact bug looked
+correct on paper.
 
 **Fret positions are a fraction of scale length, not of the widget.** A 22-fret neck
 spans only ~72% of the scale length, so `fretboard.py` rescales so the last fret lands
@@ -384,6 +393,8 @@ caller passes review easily.
 - Settings: `~/.config/guitar-trainer/config.toml` (written atomically; unknown keys
   ignored so a newer version's config cannot stop an older one starting)
 - History: `~/.local/share/guitar-trainer/stats.db`
+- Cached UI icons (combo/spin-box arrows): `~/.local/share/guitar-trainer/icons/`,
+  generated on first launch, safe to delete (regenerated on next launch)
 
 ## Conventions
 
@@ -445,6 +456,11 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   presenting the next prompt. See the design decision above.
 - Added an accidental-naming option to Note practice: sharps, flats, or mixed at
   random (one coin flip per accidental, per session). See the design decision above.
+- Widened the default window (1100px -> 1360px) — the toolbar's Purity control and
+  flats toggle were being cut off at the old width.
+- Fixed inconsistent, low-contrast combo/spin-box arrows across the toolbar. See the
+  Gotchas entry — `theme.STYLESHEET` is now `theme.stylesheet()`, a function (arrow
+  icon generation needs a QApplication to exist first).
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
