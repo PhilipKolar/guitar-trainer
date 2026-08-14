@@ -11,4 +11,16 @@ if [[ ! -x .venv/bin/python ]]; then
     .venv/bin/pip install --quiet -e .
 fi
 
+# Qt6's xcb platform plugin needs this at runtime; without it the app aborts with
+# "Could not load the Qt platform plugin xcb" instead of showing a window.
+if command -v dpkg-query >/dev/null && ! dpkg-query -W -f='${Status}' libxcb-cursor0 2>/dev/null | grep -q "install ok installed"; then
+    echo "Missing system package libxcb-cursor0 (required for the Qt display)."
+    if command -v sudo >/dev/null; then
+        sudo apt-get install -y libxcb-cursor0
+    else
+        echo "Install it manually: apt-get install -y libxcb-cursor0" >&2
+        exit 1
+    fi
+fi
+
 exec .venv/bin/python -m guitar_trainer "$@"

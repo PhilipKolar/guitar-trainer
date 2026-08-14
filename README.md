@@ -19,6 +19,8 @@ playing in real time, and drills you on notes and chords.
 
 - Python 3.10+
 - PortAudio (`sudo apt install libportaudio2`)
+- Qt's xcb platform plugin (`sudo apt install libxcb-cursor0`) — `run.sh` checks for
+  this and offers to install it if missing
 - A microphone
 
 ## Setup
