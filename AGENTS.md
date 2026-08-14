@@ -156,6 +156,19 @@ the UI polls a beat counter.
 so metronome bleed through speakers is never scored as a played note. Click pitches are
 high and narrowband to sit far from guitar fundamentals.
 
+**Live meters (Tuner, Free Detect) are smoothed; NoteGate's stability check is a
+different thing and doesn't substitute for it.** `PitchSmoother` (`audio/pitch.py`)
+median-filters the last 3 raw frames then applies an EMA, both on the MIDI
+(log-frequency) axis since cents are linear there, not in Hz. Without this the needle
+visibly jitters on a perfectly clean, steady note — that's real frame-to-frame YIN
+noise plus the string's own micro-vibrato and decay, not a bug in the detector. NoteGate
+doesn't help here: it decides whether a note *qualifies* as a scored answer and only
+reports once, whereas the meters need something that steadies a continuous stream. A
+jump past `reset_threshold_cents` (50c) snaps immediately instead of easing through —
+needed so switching strings feels instant rather than gliding. `PracticePanel`'s
+scoring path is deliberately **not** run through this smoother; scoring wants the raw,
+fast NoteGate-filtered result, not something with even a couple of frames of EMA lag.
+
 **A harmonic-energy-ratio filter rejects noise that is loud and periodic enough to
 fool YIN.** `YinDetector._harmonic_energy_ratio` measures what fraction of a frame's
 spectral energy sits at multiples of the detected fundamental. A plucked string
@@ -184,10 +197,11 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `UNEXPLAINED_PENALTY` | 0.55 (works 0.4–0.7) | `core/chords.py` | `test_chords.py` |
 | `HARMONIC_DECAY` / `N_HARMONICS` | 0.6 / 6 | `core/chords.py` | `test_chords.py` |
 | `DEFAULT_MIN_HARMONIC_RATIO` | 0.6 (guitar floor ~0.98, click ceiling ~0.51) | `audio/pitch.py` | `test_pitch.py::TestPurityFilter` |
+| `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
 
 ## Testing
 
-630 tests, ~7 seconds, no audio hardware and no display required.
+644 tests, ~7 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -280,6 +294,10 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   wired to the live signal path, only exercised by tests calling it directly.
 - Free detect now also recognises chords (full 120-chord candidate set, since there's
   no drilled subset to narrow it to — an honest best-effort display, not scored).
+- Added `PitchSmoother` — the Tuner and Free Detect live meters were showing raw,
+  unsmoothed per-frame YIN output, which jitters noticeably even on a clean, steady
+  note. Median-of-3 plus EMA now smooths the display; practice-mode scoring is
+  untouched (still reads the raw NoteGate-filtered result, not this).
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:

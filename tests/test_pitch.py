@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 import synth
-from guitar_trainer.audio.pitch import NoteGate, PitchResult, YinDetector
+from guitar_trainer.audio.pitch import NoteGate, PitchResult, PitchSmoother, YinDetector
 from guitar_trainer.core.notes import STANDARD, midi_to_freq, name_to_midi, note_name
 
 SR = synth.SAMPLE_RATE
@@ -178,6 +178,133 @@ class TestPurityFilter:
         # was disabled, i.e. this must not raise and must respect the override.
         lenient.detect(padded)
         assert lenient.min_harmonic_ratio == 0.0
+
+
+class TestPitchSmoother:
+    """Live-display smoothing for the Tuner and Free Detect meters.
+
+    This is what fixes the needle jumping around on a single steady note: raw
+    per-frame YIN output has real frame-to-frame jitter even on clean audio, and
+    NoteGate doesn't help here since it exists to decide whether a note qualifies as a
+    scored answer, not to steady a continuously-updating meter. Thresholds below were
+    picked by simulating realistic jitter and outliers — see the tuning notes in
+    audio/pitch.py's SMOOTHER_* constants.
+    """
+
+    def result(self, midi_float: float, **kwargs) -> PitchResult:
+        return PitchResult.from_freq(
+            midi_to_freq(midi_float), kwargs.get("confidence", 0.9), kwargs.get("rms", 0.1)
+        )
+
+    def test_first_frame_passes_through_immediately(self):
+        """No dead silence at note onset while the median filter fills up."""
+        smoother = PitchSmoother()
+        out = smoother.push(self.result(69.0))
+        assert out is not None
+        assert out.midi == 69
+
+    def test_steady_jitter_is_reduced(self):
+        rng = np.random.default_rng(0)
+        smoother = PitchSmoother()
+        raw_cents_error = []
+        smoothed_cents_error = []
+        for _ in range(100):
+            jittered = 45.0 + rng.normal(0, 0.08)  # ~8 cents std, realistic frame noise
+            out = smoother.push(self.result(jittered))
+            raw_cents_error.append((jittered - 45.0) * 100)
+            smoothed_cents_error.append((out.midi_float - 45.0) * 100)
+
+        # Skip the first few frames while the median window and EMA are still filling.
+        # ~8 cents of input noise should come down to a few cents, not eliminated
+        # outright — this is a live meter, not a scoring gate.
+        assert np.std(smoothed_cents_error[10:]) < 5.0
+        assert np.std(smoothed_cents_error[10:]) < np.std(raw_cents_error[10:]) * 0.6
+
+    def test_single_frame_outlier_is_rejected(self):
+        """A lone wild estimate must not make the needle jump — the median-of-3
+        pre-filter is what an EMA alone cannot do."""
+        smoother = PitchSmoother()
+        for _ in range(5):
+            smoother.push(self.result(45.0))
+        out = smoother.push(self.result(45.0 + 1.0))  # one frame, 100 cents off
+        assert abs((out.midi_float - 45.0) * 100) < 20.0
+
+    def test_genuine_note_change_snaps_quickly(self):
+        """A real string/fret change must not glide through the notes in between."""
+        smoother = PitchSmoother()
+        for _ in range(10):
+            smoother.push(self.result(45.0))
+        out = None
+        for _ in range(6):
+            out = smoother.push(self.result(50.0))  # a real 5-semitone jump
+        assert abs(out.midi_float - 50.0) < 0.1
+
+    def test_small_bend_is_smoothed_not_snapped(self):
+        """A bend/vibrato-sized movement (under the reset threshold) should ease
+        rather than jump, since that's expressive pitch movement, not a new note.
+
+        The median-of-3 pre-filter needs the new pitch to hold for two consecutive
+        frames before it becomes the majority in its window — a single frame's worth
+        of movement is exactly the kind of blip the filter is designed to absorb, by
+        the same mechanism that rejects true outliers.
+        """
+        smoother = PitchSmoother(reset_threshold_cents=50.0)
+        for _ in range(10):
+            smoother.push(self.result(45.0))
+        smoother.push(self.result(45.0 + 0.3))  # first frame of the bend
+        out = smoother.push(self.result(45.0 + 0.3))  # second: now the majority
+        moved = abs((out.midi_float - 45.0) * 100)
+        assert 0 < moved < 30  # eased partway there, not instantly at the target
+
+    def test_large_jump_resets_instead_of_easing(self):
+        smoother = PitchSmoother(reset_threshold_cents=50.0)
+        for _ in range(10):
+            smoother.push(self.result(45.0))
+        smoother.push(self.result(46.0))  # first frame of the new note
+        out = smoother.push(self.result(46.0))  # second: the median now sees it
+        assert out.midi_float == pytest.approx(46.0)
+
+    def test_silence_resets_immediately(self):
+        smoother = PitchSmoother()
+        smoother.push(self.result(45.0))
+        assert smoother.push(None) is None
+        # No lingering state — the very next note should not ease in from the old one.
+        out = smoother.push(self.result(50.0))
+        assert out.midi_float == pytest.approx(50.0)
+
+    def test_reset_clears_state(self):
+        smoother = PitchSmoother()
+        smoother.push(self.result(45.0))
+        smoother.reset()
+        out = smoother.push(self.result(50.0))
+        assert out.midi_float == pytest.approx(50.0)
+
+    def test_preserves_confidence_rms_and_harmonic_ratio(self):
+        smoother = PitchSmoother()
+        result = PitchResult.from_freq(midi_to_freq(45.0), 0.77, 0.05, 0.91)
+        out = smoother.push(result)
+        assert out.confidence == pytest.approx(0.77)
+        assert out.rms == pytest.approx(0.05)
+        assert out.harmonic_ratio == pytest.approx(0.91)
+
+    def test_smooths_a_real_detector_stream(self, detector):
+        """End-to-end sanity check against actual YIN output, not just synthetic
+        midi-float jitter."""
+        freq = midi_to_freq(name_to_midi("A2"))
+        signal = synth.plucked_string(freq, duration=1.0, attack_noise=0.05)
+        smoother = PitchSmoother()
+
+        raw_cents, smoothed_cents = [], []
+        for start in range(4096, len(signal) - WINDOW, 1024):
+            result = detector.detect(signal[start : start + WINDOW])
+            if result is None:
+                continue
+            raw_cents.append(result.cents)
+            out = smoother.push(result)
+            smoothed_cents.append(out.cents)
+
+        assert len(smoothed_cents) > 10
+        assert np.std(smoothed_cents[5:]) <= np.std(raw_cents[5:])
 
 
 class TestPitchResult:

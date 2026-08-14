@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..audio.metronome import MAX_BPM, MIN_BPM, BeatCounter, Metronome
+from ..audio.pitch import PitchSmoother
 from ..core.chords import CHORD_QUALITIES, QUALITY_SUFFIX, Chord, ChordGate, ChordMatcher, all_chords
 from ..core.notes import (
     ALL_NOTES,
@@ -101,6 +102,7 @@ class TunerPanel(ModePanel):
     def __init__(self, tuning: Tuning, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._tuning = tuning
+        self._smoother = PitchSmoother()
 
         self.note_label = BigNoteLabel("—")
         self.meter = CentsMeter()
@@ -143,6 +145,7 @@ class TunerPanel(ModePanel):
     def on_pitch(self, result) -> None:
         if not self.active:
             return
+        result = self._smoother.push(result)
         if result is None:
             self.note_label.show_text(None)
             self.meter.set_cents(None)
@@ -168,6 +171,10 @@ class TunerPanel(ModePanel):
             f"string {self._tuning.string_count - string} · "
             f"{result.freq:.2f} Hz · {cents:+.1f} cents"
         )
+
+    def on_deactivated(self) -> None:
+        super().on_deactivated()
+        self._smoother.reset()
 
 
 class FreeDetectPanel(ModePanel):
@@ -216,10 +223,12 @@ class FreeDetectPanel(ModePanel):
         self._note_active = False
         self._bass: int | None = None
         self._chord_gate = ChordGate(self._CHORD_MATCHER)
+        self._smoother = PitchSmoother()
 
     def on_pitch(self, result) -> None:
         if not self.active:
             return
+        result = self._smoother.push(result)
         if result is None:
             self.meter.set_cents(None)
             if not self._note_active:
@@ -273,6 +282,7 @@ class FreeDetectPanel(ModePanel):
         super().on_deactivated()
         self._note_active = False
         self._chord_gate.reset()
+        self._smoother.reset()
         self.highlight_requested.emit(None)
         self.chord_highlight_requested.emit(None)
 

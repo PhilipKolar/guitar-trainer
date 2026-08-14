@@ -79,6 +79,10 @@ buffer. A worker thread runs the analysis and emits results to the UI as queued 
   sits at multiples of the detected pitch — a plucked string does this almost entirely, while a
   keyboard click or knock spreads its energy across the spectrum instead. This is what the **Purity**
   control adjusts.
+- **Smoothing**: the Tuner and Free Detect meters run raw pitch estimates through a median filter
+  and a light moving average before showing them, since even a clean, steady note has some
+  frame-to-frame jitter. A genuine note change (switching strings) still snaps immediately rather
+  than gliding through the notes in between.
 
 ## Desktop entry
 

@@ -193,6 +193,33 @@ class TestTunerPanel:
         panel.set_tuning(DROP_D)
         assert "D2" in panel.strings.text()
 
+    def test_live_readout_is_smoothed(self, qapp):
+        """Regression coverage for the needle jitter fix: a single wild outlier frame
+        amid a steady note must not swing the displayed cents value wildly."""
+        panel = TunerPanel(STANDARD)
+        panel.on_activated()
+        base = name_to_midi("A2")
+        for _ in range(6):
+            panel.on_pitch(PitchResult.from_freq(midi_to_freq(base), 0.9, 0.1))
+        outlier = PitchResult.from_freq(midi_to_freq(base + 1.0), 0.9, 0.1)  # 100c off
+        panel.on_pitch(outlier)
+        # Cents shown are relative to the nearest string target (still A2), so a
+        # rejected outlier should leave it close to in tune, not swing to ~100 cents.
+        _, cents = STANDARD.nearest_string(midi_to_freq(base))
+        assert abs(panel.meter._cents) < 20.0
+
+    def test_deactivation_resets_smoothing(self, qapp):
+        panel = TunerPanel(STANDARD)
+        panel.on_activated()
+        # Fill the median window with the old note, so a leftover buffer would bias
+        # the first reading after reactivation if it weren't cleared.
+        for _ in range(3):
+            panel.on_pitch(pitch(name_to_midi("A2")))
+        panel.on_deactivated()
+        panel.on_activated()
+        panel.on_pitch(pitch(name_to_midi("E4")))
+        assert panel.note_label.text() == "E4"
+
 
 class TestFreeDetectPanel:
     def test_shows_stable_notes(self, qapp):
@@ -316,6 +343,26 @@ class TestFreeDetectPanel:
         for _ in range(3):
             panel.on_chroma(chroma)
         assert panel.note_label.text() == "—"
+
+    def test_live_meter_readout_is_smoothed(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        base = name_to_midi("A2")
+        for _ in range(6):
+            panel.on_pitch(PitchResult.from_freq(midi_to_freq(base), 0.9, 0.1))
+        outlier = PitchResult.from_freq(midi_to_freq(base + 1.0), 0.9, 0.1)  # 100c off
+        panel.on_pitch(outlier)
+        assert abs(panel.meter._cents) < 20.0
+
+    def test_deactivation_resets_smoothing(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        for _ in range(3):
+            panel.on_pitch(pitch(name_to_midi("A2")))
+        panel.on_deactivated()
+        panel.on_activated()
+        panel.on_pitch(pitch(name_to_midi("E4")))
+        assert panel.meter._cents == pytest.approx(0.0, abs=1.0)
 
 
 class TestNotePracticePanel:

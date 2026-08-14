@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..core.notes import cents_off, freq_to_midi, nearest_note, note_name
+from ..core.notes import cents_off, freq_to_midi, midi_to_freq, nearest_note, note_name
 
 #: Guitar range with headroom: below open low E, up to the 24th fret of the high E.
 MIN_FREQ = 70.0
@@ -350,3 +350,78 @@ class NoteGate:
         stable = sorted(self._history, key=lambda r: r.midi_float)[len(self._history) // 2]
         self._current = stable
         return stable
+
+
+#: How much a new (median-filtered) estimate moves the smoothed value each frame.
+#: Tuned in tests/test_pitch.py::TestPitchSmoother against synthetic jitter: this
+#: cuts steady-state noise from ~15 cents std down to ~3, without adding more than a
+#: couple of frames of lag on real pitch movement.
+SMOOTHER_ALPHA = 0.2
+#: A jump bigger than this snaps instantly instead of sliding through it — the
+#: difference between "this note bent" and "a different string is now ringing".
+SMOOTHER_RESET_CENTS = 50.0
+SMOOTHER_MEDIAN_WINDOW = 3
+
+
+class PitchSmoother:
+    """Smooths a stream of per-frame pitch estimates for live display.
+
+    Raw single-frame YIN output has real frame-to-frame jitter even on a clean,
+    steady note — from windowing/estimation noise, from the string's own decay and
+    micro-vibrato, and occasionally a single-frame outlier. None of that is something
+    NoteGate helps with here: NoteGate exists to decide *whether* a note qualifies as
+    a scored answer, not to steady what's continuously shown on a live meter, and it
+    only reports once a note has already settled rather than every frame.
+
+    A median-of-3 pre-filter kills isolated single-frame outliers almost entirely
+    (spikes that would otherwise show as a wild swing on the needle); an exponential
+    moving average on top removes the residual smaller jitter. Both operate on the
+    MIDI (log-frequency) axis, since cents — and human pitch perception — are linear
+    there, not in Hz. A jump past ``reset_threshold_cents`` snaps immediately rather
+    than sliding through intervening pitches, so switching strings feels instant
+    rather than gliding.
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = SMOOTHER_ALPHA,
+        reset_threshold_cents: float = SMOOTHER_RESET_CENTS,
+        median_window: int = SMOOTHER_MEDIAN_WINDOW,
+    ) -> None:
+        self.alpha = alpha
+        self.reset_threshold_cents = reset_threshold_cents
+        self._median_window = median_window
+        self._buffer: deque[float] = deque(maxlen=median_window)
+        self._state: float | None = None
+        self._last_extras: PitchResult | None = None
+
+    def reset(self) -> None:
+        self._buffer.clear()
+        self._state = None
+        self._last_extras = None
+
+    def push(self, result: PitchResult | None) -> PitchResult | None:
+        """Feed one raw frame. Returns a smoothed result, or ``None`` on silence."""
+        if result is None:
+            self.reset()
+            return None
+
+        self._buffer.append(result.midi_float)
+        self._last_extras = result
+        if len(self._buffer) < self._median_window:
+            # Not enough history yet to median-filter; pass the raw estimate through
+            # rather than waiting, so there's no dead silence at the very start of a
+            # note before smoothing kicks in a couple of frames later.
+            candidate = result.midi_float
+        else:
+            candidate = float(np.median(self._buffer))
+
+        if self._state is None or abs((candidate - self._state) * 100) > self.reset_threshold_cents:
+            self._state = candidate
+        else:
+            self._state += self.alpha * (candidate - self._state)
+
+        return PitchResult.from_freq(
+            midi_to_freq(self._state), result.confidence, result.rms, result.harmonic_ratio
+        )
