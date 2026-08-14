@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guitar-trainer"
+version = "0.1.0"
+description = "Desktop guitar practice app with real-time note and chord detection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Philip Kolar" }]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "sounddevice>=0.4.6",
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-qt>=4.2"]
+
+[project.scripts]
+guitar-trainer = "guitar_trainer.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:guitar_trainer.*"]
