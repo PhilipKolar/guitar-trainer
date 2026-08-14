@@ -176,11 +176,21 @@ class TestTunerPanel:
         panel.on_pitch(result)
         assert "loosen" in panel.status.text()
 
-    def test_silence_resets(self, qapp):
+    def test_silence_holds_the_last_reading_briefly(self, qapp):
+        """A decaying note's sustain routinely drops below the gate before it's
+        actually inaudible; the display must not blank the instant that happens."""
         panel = TunerPanel(STANDARD)
         panel.on_activated()
         panel.on_pitch(pitch(name_to_midi("A2")))
         panel.on_pitch(None)
+        assert panel.note_label.text() == "A2"
+
+    def test_display_clears_once_the_hold_expires(self, qapp):
+        panel = TunerPanel(STANDARD)
+        panel.on_activated()
+        panel.on_pitch(pitch(name_to_midi("A2")))
+        panel.on_pitch(None)
+        panel._clear_display()  # simulate the hold timer firing, without the wait
         assert panel.note_label.text() == "—"
 
     def test_inactive_panel_ignores_input(self, qapp):
@@ -236,12 +246,29 @@ class TestFreeDetectPanel:
         panel.on_note_stable(pitch(name_to_midi("A4")))
         assert seen == [9]
 
-    def test_release_clears(self, qapp):
+    def test_release_holds_the_last_reading_briefly(self, qapp):
         panel = FreeDetectPanel()
         panel.on_activated()
         panel.on_note_stable(pitch(name_to_midi("A4")))
         panel.on_note_released()
+        assert panel.note_label.text() == "A4"
+
+    def test_display_clears_once_the_hold_expires(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("A4")))
+        panel.on_note_released()
+        panel._clear_display()  # simulate the hold timer firing, without the wait
         assert panel.note_label.text() == "—"
+
+    def test_release_allows_chord_detection_to_resume_immediately(self, qapp):
+        """The arbitration flag must flip right away even though the visible display
+        is held — otherwise a chord strummed right after a note would be ignored."""
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("A4")))
+        panel.on_note_released()
+        assert panel._note_active is False
 
     def test_history_deduplicates_repeats(self, qapp):
         panel = FreeDetectPanel()
@@ -257,6 +284,30 @@ class TestFreeDetectPanel:
         for i in range(40):
             panel.on_note_stable(pitch(40 + i))
         assert len(panel._recent) <= 12
+
+    def test_hold_timer_actually_fires_after_real_time(self, qapp):
+        """End-to-end check that the timer is wired up, not just that
+        _clear_display works when called directly."""
+        from PySide6.QtCore import QEventLoop, QTimer as QtTimer
+
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("A4")))
+        assert panel.note_label.text() == "A4"
+
+        loop = QEventLoop()
+        QtTimer.singleShot(panel._hold_timer.interval() + 150, loop.quit)
+        loop.exec()
+
+        assert panel.note_label.text() == "—"
+
+    def test_fresh_activity_cancels_a_pending_clear(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("A4")))
+        panel.on_note_released()  # display is now held, counting down to clear
+        panel.on_note_stable(pitch(name_to_midi("B4")))  # restarts the hold
+        assert panel.note_label.text() == "B4"
 
     def test_recognises_a_chord(self, qapp):
         panel = FreeDetectPanel()
@@ -722,3 +773,78 @@ class TestMainWindow:
             assert window._calibration_samples == [0.03]
             window.analysis = None
             window.close()
+
+
+class TestSettingsPersistence:
+    """Regression coverage for selections not surviving a quick close.
+
+    A change used to only be written to disk by a graceful window close or the 30s
+    periodic timer; stopping the app via Ctrl-C in the launching terminal skipped
+    closeEvent entirely (Qt doesn't route SIGINT there by default), and even a
+    graceful close moments after a change relied on that single save happening to
+    catch it. Settings changes now save promptly on their own via a debounced timer.
+    """
+
+    def _window(self, tmp_path, monkeypatch, config=None):
+        import guitar_trainer.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "list_input_devices", lambda: [])
+        store = StatsStore(tmp_path / "s.db")
+        window = mw.MainWindow(config or Config(), store)
+        return window, store
+
+    def test_toolbar_change_schedules_a_prompt_save(self, qapp, tmp_path, monkeypatch):
+        window, store = self._window(tmp_path, monkeypatch)
+        assert not window._dirty_timer.isActive()
+        window.fret_spin.setValue(24)
+        assert window._dirty_timer.isActive()
+        window.analysis = None
+        window.close()
+        store.close()
+
+    def test_note_selection_change_schedules_a_prompt_save(self, qapp, tmp_path, monkeypatch):
+        window, store = self._window(tmp_path, monkeypatch)
+        window.note_practice.note_set_combo.setCurrentText("Naturals only")
+        assert window._dirty_timer.isActive()
+        window.analysis = None
+        window.close()
+        store.close()
+
+    def test_chord_selection_change_schedules_a_prompt_save(self, qapp, tmp_path, monkeypatch):
+        window, store = self._window(tmp_path, monkeypatch)
+        window.chord_practice._clear_selection()
+        assert window._dirty_timer.isActive()
+        window.analysis = None
+        window.close()
+        store.close()
+
+    def test_dirty_timer_actually_saves(self, qapp, tmp_path, monkeypatch):
+        import guitar_trainer.core.config as config_module
+
+        config_path = tmp_path / "config.toml"
+        monkeypatch.setattr(config_module, "config_path", lambda: config_path)
+        window, store = self._window(tmp_path, monkeypatch)
+
+        window.fret_spin.setValue(24)
+        window._dirty_timer.stop()
+        window._save_config()  # simulate the debounce timer firing, without the wait
+
+        assert Config.load(config_path).fret_count == 24
+        window.analysis = None
+        window.close()
+        store.close()
+
+    def test_a_quick_change_then_close_still_persists(self, qapp, tmp_path, monkeypatch):
+        """The scenario this whole fix is for: change something, close moments later."""
+        import guitar_trainer.core.config as config_module
+
+        config_path = tmp_path / "config.toml"
+        monkeypatch.setattr(config_module, "config_path", lambda: config_path)
+        window, store = self._window(tmp_path, monkeypatch)
+
+        window.note_practice.note_set_combo.setCurrentText("Naturals only")
+        window.analysis = None
+        window.close()  # closeEvent saves immediately; doesn't need the debounce to fire
+        store.close()
+
+        assert Config.load(config_path).note_set == "Naturals only"

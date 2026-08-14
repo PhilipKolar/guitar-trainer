@@ -183,6 +183,47 @@ would need timbral classification (formants, MFCCs), not a purity ratio; the hon
 mitigation is the RMS gate plus mic placement, not this filter. Don't oversell it in UI
 copy or docs — say what it actually does.
 
+**The metronome carries click overhang across audio blocks in a persistent tail
+buffer.** A click (25ms, 1200 samples @ 48kHz) is longer than a typical output block
+(512 samples, ~11ms), so most clicks span two or three callbacks. The original code
+wrote what fit in the current block and silently dropped the rest — a real bug, not a
+simplification: it truncated almost every click mid-waveform, which is audible as a
+harsh, distorted tick rather than a clean one. `Metronome._tail` (sized to the longest
+click) now carries the undelivered remainder forward and plays it out over however many
+subsequent callbacks it takes. See `test_session.py::TestMetronome::test_click_survives_every_block_size`,
+parametrised across block sizes from 64 to 1024 — this is the kind of bug that only
+shows up at specific, common block sizes, so a single test at the default 512 would not
+have been enough of a regression net.
+
+**Live meter "hold": a decaying note's audible sustain outlasts the gate.** After the
+gate-wiring fix (frame_analysed now respects the configured RMS gate), the Tuner and
+Free Detect readouts started blanking the instant a plucked note's volume decayed below
+the gate — technically correct, but it felt broken, since a note that's still ringing
+audibly routinely reads as "below the gate" well before it's actually inaudible.
+`METER_HOLD_MS` (700ms) keeps the last reading on screen for a grace period after
+detection drops out; only the timer's timeout actually clears the display. In
+`FreeDetectPanel` this is a *single shared* timer for both the note and chord readouts
+— `on_note_released` only flips the `_note_active` arbitration flag immediately (so
+chord matching can resume without waiting), it does not clear anything itself.
+
+**Settings persist through a debounced immediate save, not just on close.** Every
+config-mutating UI handler calls `_mark_dirty()` (`MainWindow`) or emits
+`config_changed` (practice panels, routed to the same place), which (re)starts a 400ms
+singleshot timer that then calls `_save_config()`. This exists because relying only on
+`closeEvent` + a 30s periodic timer left two real gaps: Ctrl-C in the terminal that
+launched `run.sh` never reached `closeEvent` at all (Qt doesn't route SIGINT to it by
+default — see `__main__.py`'s signal handler and keepalive `QTimer`), and even a
+graceful close moments after a change relied on that one save happening to land. The
+periodic 30s timer is kept only as a fallback safety net.
+
+**Practice challenges are generated ahead of being consumed, via a lookahead queue.**
+`ChallengePicker._queue` holds challenges that have already been decided (with the same
+no-repeat and weighting rules as `next()`) but not yet handed out. `peek(n)` reads from
+it, extending the queue if needed; `next()` pops the front. This is what makes the
+"next" preview honest — it shows what will actually be presented, not a second,
+independent random draw that might disagree with itself. `SessionEngine.previous` and
+`.upcoming()` expose this to the UI.
+
 ## Tuned constants
 
 Changing these has non-obvious consequences; the referenced tests are the safety net.
@@ -198,10 +239,12 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `HARMONIC_DECAY` / `N_HARMONICS` | 0.6 / 6 | `core/chords.py` | `test_chords.py` |
 | `DEFAULT_MIN_HARMONIC_RATIO` | 0.6 (guitar floor ~0.98, click ceiling ~0.51) | `audio/pitch.py` | `test_pitch.py::TestPurityFilter` |
 | `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
+| `METER_HOLD_MS` | 700 | `ui/modes.py` | `test_ui.py` (Tuner/FreeDetect hold tests) |
+| debounced save delay | 400ms | `ui/main_window.py` `_mark_dirty` | `test_ui.py::TestSettingsPersistence` |
 
 ## Testing
 
-644 tests, ~7 seconds, no audio hardware and no display required.
+677 tests, ~8 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -235,6 +278,17 @@ the *bottom*. Tuning tuples are ordered low to high.
 
 **Devices are remembered by name, not index.** PortAudio indices shift as devices come
 and go; `config.device_name` is matched against the combo text.
+
+**Ad-hoc verification scripts (screenshots, manual smoke tests) must isolate
+`XDG_CONFIG_HOME`/`XDG_DATA_HOME`, or set `--path` explicitly on `StatsStore`.**
+`MainWindow()` called with no arguments loads and can write to the *real* user config
+(`~/.config/guitar-trainer/config.toml`) and stats DB (`~/.local/share/guitar-trainer/stats.db`)
+— the same files the actual running app uses. Manual verification during this session
+did exactly that: a screenshot script called `_clear_selection()` against the real
+config, and repeated smoke-test sessions wrote synthetic attempts into the real stats
+DB, both without the author's real prior state being recoverable afterwards. Always
+pass an explicit `Config`/`StatsStore` pointed at a tmp path (as the test suite already
+does via fixtures) for anything beyond running the actual app.
 
 **Ambient noise on this machine is significant** — measured idle RMS ~0.05 against a
 default gate of 0.01. There's a **Calibrate** button next to the Gate control
@@ -298,6 +352,23 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   unsmoothed per-frame YIN output, which jitters noticeably even on a clean, steady
   note. Median-of-3 plus EMA now smooths the display; practice-mode scoring is
   untouched (still reads the raw NoteGate-filtered result, not this).
+- Fixed the metronome truncating almost every click mid-decay at block boundaries
+  (distorted/cut-off sound in rhythm mode) — see the design decision above.
+- Live meters (Tuner, Free Detect) now hold the last reading for `METER_HOLD_MS`
+  after detection drops out, instead of blanking the instant a decaying note falls
+  below the gate.
+- Note/chord practice now shows a "Previous" and "Next" preview flanking the current
+  prompt, with a brief fade animation on prompt/feedback changes. Backed by
+  `ChallengePicker.peek()` / `SessionEngine.upcoming()`.
+- Settings now save promptly on every change (debounced ~400ms), not just on
+  graceful close + a 30s timer — Ctrl-C in the terminal used to skip the save
+  entirely. See the design decision and the SIGINT handling in `__main__.py`.
+- **Data pollution note**: manual verification during this round of fixes wrote to
+  the real `~/.config/guitar-trainer/config.toml` and `~/.local/share/guitar-trainer/stats.db`
+  (a screenshot script cleared the real chord selection; smoke-test sessions added
+  synthetic attempts to the real stats history). The author was told; there's no way
+  to recover what was there before. See the new Gotchas entry — always isolate
+  `XDG_CONFIG_HOME`/`XDG_DATA_HOME` for anything beyond running the real app.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -307,15 +378,19 @@ checks that still want a human with an instrument:
    Loud sustained speech that clears the gate will still register — that's expected,
    not a bug (see the purity-filter design decision) — but it should take real volume
    to do it, not just a normal-volume comment.
-2. Tuner: each open string reads correctly, needle centres when in tune.
+2. Tuner: each open string reads correctly, needle centres when in tune; note holds
+   briefly (not abruptly) after a string stops ringing.
 3. Free detect: chromatic scale up the low E, then above the 12th fret (octave errors);
    strum a chord and confirm it's recognised once the note readout goes quiet.
-4. Note practice: ~20 prompts register promptly; wrong notes are not accepted.
-5. **Rhythm mode at 60 BPM through speakers** — confirm the click is never scored as a
-   played note. This is the least-trusted part; if it leaks, widen the suppression
-   window in `modes.py:_on_tick`.
+4. Note/chord practice: the Previous/Next preview should feel accurate and useful,
+   not distracting; check the fade animation isn't janky on real hardware.
+5. **Rhythm mode at 60 BPM through speakers** — the click should now sound clean, not
+   distorted or cut off. This was the highest-confidence bug of this batch (the old
+   behavior was provably wrong, not just untuned), but hasn't been heard for real yet.
 6. Chord practice: open vs barre voicings; Am vs C and Em vs G not confused (this now
    has a real bass-note signal behind it, worth specifically re-checking).
+7. Settings: change a note/chord selection or a toolbar control, quit via Ctrl-C in
+   the terminal within a couple seconds, relaunch — it should be remembered.
 
 Ideas, none committed to: per-string practice restriction, scale/arpeggio drills,
 detecting *which* string was played (needs more than a mono signal), PyInstaller

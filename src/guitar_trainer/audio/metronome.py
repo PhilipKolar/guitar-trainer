@@ -71,6 +71,14 @@ class Metronome:
         self._stream = None
         self._error: str | None = None
 
+        # A click (25ms, 1200 samples) is longer than a typical output block (512
+        # samples, ~11ms) — most clicks span two or three callbacks. This buffer
+        # carries whatever didn't fit in the current block forward to the next one(s),
+        # indexed relative to the sample right after the current block. Sized to the
+        # longest click, which bounds how far a click can ever need to carry over.
+        self._tail_len = max(len(self._downbeat), len(self._offbeat))
+        self._tail = np.zeros(self._tail_len, dtype=np.float32)
+
     # ---------------------------------------------------------------- config
 
     def _compute_period(self) -> int:
@@ -120,16 +128,34 @@ class Metronome:
             block_end = block_start + frames
             samples_per_beat = self._samples_per_beat
 
+            # Start this block with whatever carried over from a click that ran past
+            # the end of the previous one.
+            carry = min(frames, self._tail_len)
+            if carry:
+                outdata[:carry, 0] += self._tail[:carry]
+            # Shift the tail buffer left by a block's worth of samples: what was at
+            # position `frames` is now relative to the start of the *next* block.
+            if frames < self._tail_len:
+                self._tail[: self._tail_len - frames] = self._tail[frames:]
+                self._tail[self._tail_len - frames :] = 0.0
+            else:
+                self._tail[:] = 0.0
+
             while self._next_beat_at < block_end:
                 offset = self._next_beat_at - block_start
                 if offset >= 0 and not self.muted:
                     is_downbeat = self._beat_index % self.beats_per_bar == 0
                     click = self._downbeat if is_downbeat else self._offbeat
-                    # A click may run past the end of the block; write what fits and
-                    # let the rest be dropped rather than stretching the block.
-                    usable = min(len(click), frames - offset)
-                    if usable > 0:
-                        outdata[offset : offset + usable, 0] += click[:usable]
+
+                    in_block = min(len(click), frames - offset)
+                    if in_block > 0:
+                        outdata[offset : offset + in_block, 0] += click[:in_block]
+                    # Whatever didn't fit carries into the tail buffer instead of
+                    # being dropped, so the click finishes its decay in a later block
+                    # rather than cutting off mid-waveform.
+                    remaining = len(click) - in_block
+                    if remaining > 0:
+                        self._tail[:remaining] += click[in_block:]
 
                 self._beat_index += 1
                 self._next_beat_at += samples_per_beat
@@ -149,6 +175,7 @@ class Metronome:
             self._sample_pos = 0
             self._beat_index = 0
             self._next_beat_at = 0
+            self._tail[:] = 0.0
 
         try:
             self._stream = sd.OutputStream(

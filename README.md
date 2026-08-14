@@ -12,10 +12,13 @@ playing in real time, and drills you on notes and chords.
   position on the fretboard.
 - **Fretboard map** — realistic fret spacing, with note names optionally shown (none / naturals
   only / all notes).
-- **Note practice** — prompts a random note; you play it in any octave.
-- **Chord practice** — prompts a random chord from a set you configure.
+- **Note practice** — prompts a random note; you play it in any octave. Shows what you just
+  played and what's coming up next, so you can look ahead while you practise.
+- **Chord practice** — prompts a random chord from a set you configure, with the same
+  previous/next preview.
 - **Timing** — free mode, or rhythm mode driven by an audible metronome at a set BPM.
 - **Stats** — accuracy and response times per note and chord, stored locally in SQLite.
+- Settings (device, tuning, note/chord selections, tempo, ...) are remembered across runs.
 
 ## Requirements
 

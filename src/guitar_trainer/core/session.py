@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Protocol, Sequence, runtime_checkable
@@ -127,8 +128,11 @@ class ChallengePicker:
         self.rng = rng or random.Random()
         self.weight_fn = weight_fn
         self._previous: Challenge | None = None
+        # Generated ahead of being consumed, so peek() can show what's coming up
+        # without that answer changing between the peek and the actual presentation.
+        self._queue: deque[Challenge] = deque()
 
-    def next(self) -> Challenge:
+    def _generate(self) -> Challenge:
         candidates = [c for c in self.challenges if c != self._previous]
         if not candidates:
             # Only one challenge in the set, so repetition is unavoidable.
@@ -143,8 +147,30 @@ class ChallengePicker:
         self._previous = choice
         return choice
 
+    def _ensure_queued(self, n: int) -> None:
+        while len(self._queue) < n:
+            self._queue.append(self._generate())
+
+    def next(self) -> Challenge:
+        self._ensure_queued(1)
+        return self._queue.popleft()
+
+    def peek(self, ahead: int = 1) -> Challenge | None:
+        """The challenge ``ahead`` positions past the one about to be returned by
+        :meth:`next`, without consuming it — what a "coming up" preview shows.
+
+        ``peek(1)`` is the challenge that will follow whichever one is presented next;
+        it does not change on repeated calls, since it's already been decided (with
+        the same no-immediate-repeat rule ``next()`` uses), just not handed out yet.
+        """
+        if ahead < 1:
+            return None
+        self._ensure_queued(ahead)
+        return self._queue[ahead - 1]
+
     def reset(self) -> None:
         self._previous = None
+        self._queue.clear()
 
 
 @dataclass
@@ -166,6 +192,9 @@ class SessionEngine:
 
     state: SessionState = SessionState.IDLE
     current: Challenge | None = None
+    previous: Challenge | None = None
+    """The challenge presented immediately before ``current`` — what was just
+    resolved, for a "last played" reference alongside the current prompt."""
     attempts: list[Attempt] = field(default_factory=list)
     _started_at: float = 0.0
 
@@ -174,6 +203,7 @@ class SessionEngine:
     def start(self) -> Challenge:
         """Begin a session and present the first challenge."""
         self.attempts.clear()
+        self.current = None  # so _present()'s `previous = current` starts at None
         self.picker.reset()
         return self._present()
 
@@ -181,7 +211,18 @@ class SessionEngine:
         self.state = SessionState.FINISHED
         self.current = None
 
+    def upcoming(self, n: int = 1) -> list[Challenge]:
+        """The next ``n`` challenges after ``current``, without consuming them."""
+        result = []
+        for i in range(1, n + 1):
+            challenge = self.picker.peek(i)
+            if challenge is None:
+                break
+            result.append(challenge)
+        return result
+
     def _present(self) -> Challenge:
+        self.previous = self.current
         self.current = self.picker.next()
         self.state = SessionState.LISTENING
         self._started_at = self.clock()

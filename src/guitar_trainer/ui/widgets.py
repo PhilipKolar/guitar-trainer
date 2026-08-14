@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, Qt
 from PySide6.QtGui import QFont, QLinearGradient, QPainter
-from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from . import theme
 
@@ -144,3 +144,52 @@ class BigNoteLabel(QLabel):
         self.setText(text or self.placeholder)
         color = color or (theme.TEXT if text else theme.TEXT_DIM)
         self.setStyleSheet(f"color: {color.name()};")
+
+
+class CaptionedLabel(QWidget):
+    """A small caption above a value — the previous/next challenge preview."""
+
+    def __init__(self, caption: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        self.caption = QLabel(caption)
+        self.caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        caption_font = QFont(self.caption.font())
+        caption_font.setPointSize(9)
+        self.caption.setFont(caption_font)
+        self.caption.setStyleSheet(f"color: {theme.TEXT_DIM.name()};")
+
+        self.value = QLabel("—")
+        self.value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        value_font = QFont(self.value.font())
+        value_font.setPointSize(22)
+        value_font.setBold(True)
+        self.value.setFont(value_font)
+        self.value.setStyleSheet(f"color: {theme.TEXT_DIM.name()};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self.caption)
+        layout.addWidget(self.value)
+
+    def set_text(self, text: str | None) -> None:
+        self.value.setText(text or "—")
+
+
+def fade_in(widget: QWidget, *, duration_ms: int = 220) -> QPropertyAnimation:
+    """Attach a reusable fade-from-dim animation to a widget and return it.
+
+    Call ``.stop(); .start()`` on the result whenever the widget's content changes, so
+    each change gets a brief, tasteful pop rather than appearing instantly. Keeping the
+    QGraphicsOpacityEffect and QPropertyAnimation alive as attributes on the widget's
+    parent is the caller's responsibility — Qt does not keep them alive on its own.
+    """
+    effect = QGraphicsOpacityEffect(widget)
+    widget.setGraphicsEffect(effect)
+    animation = QPropertyAnimation(effect, b"opacity", widget)
+    animation.setDuration(duration_ms)
+    animation.setStartValue(0.3)
+    animation.setEndValue(1.0)
+    animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+    return animation

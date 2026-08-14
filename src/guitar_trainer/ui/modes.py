@@ -50,7 +50,7 @@ from ..core.session import (
 )
 from . import theme
 from .fretboard import FretboardWidget
-from .widgets import BigNoteLabel, CentsMeter
+from .widgets import BigNoteLabel, CaptionedLabel, CentsMeter, fade_in
 
 
 class ModePanel(QWidget):
@@ -65,6 +65,9 @@ class ModePanel(QWidget):
     highlight_requested = Signal(object)  # int | None
     #: Ask the main window to highlight a set of pitch classes, e.g. a recognised chord.
     chord_highlight_requested = Signal(object)  # list[int] | None
+    #: A config-backed setting changed (note/chord selection, tempo, ...); the main
+    #: window should persist it promptly rather than waiting on the periodic timer.
+    config_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -96,6 +99,13 @@ class ModePanel(QWidget):
         """
 
 
+#: How long a live meter keeps showing its last reading after the signal drops out.
+#: A plucked note's audible sustain often decays below the noise gate well before it's
+#: actually inaudible, so without this the display was blanking abruptly mid-note
+#: instead of holding briefly the way a real tuner does.
+METER_HOLD_MS = 700
+
+
 class TunerPanel(ModePanel):
     """Shows the nearest open string and how far off it is."""
 
@@ -103,6 +113,10 @@ class TunerPanel(ModePanel):
         super().__init__(parent)
         self._tuning = tuning
         self._smoother = PitchSmoother()
+
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._clear_display)
 
         self.note_label = BigNoteLabel("—")
         self.meter = CentsMeter()
@@ -147,11 +161,11 @@ class TunerPanel(ModePanel):
             return
         result = self._smoother.push(result)
         if result is None:
-            self.note_label.show_text(None)
-            self.meter.set_cents(None)
-            self.status.setText("")
-            self.detail.setText("Play a string")
+            # Don't blank immediately — a decaying note routinely drops below the
+            # gate well before it's actually inaudible. _clear_display only fires if
+            # nothing new arrives before the hold timer runs out.
             return
+        self._hold_timer.start(METER_HOLD_MS)
 
         string, cents = self._tuning.nearest_string(result.freq)
         target = self._tuning.string_label(string)
@@ -172,9 +186,17 @@ class TunerPanel(ModePanel):
             f"{result.freq:.2f} Hz · {cents:+.1f} cents"
         )
 
+    def _clear_display(self) -> None:
+        self.note_label.show_text(None)
+        self.meter.set_cents(None)
+        self.status.setText("")
+        self.detail.setText("Play a string")
+
     def on_deactivated(self) -> None:
         super().on_deactivated()
         self._smoother.reset()
+        self._hold_timer.stop()
+        self._clear_display()
 
 
 class FreeDetectPanel(ModePanel):
@@ -225,15 +247,21 @@ class FreeDetectPanel(ModePanel):
         self._chord_gate = ChordGate(self._CHORD_MATCHER)
         self._smoother = PitchSmoother()
 
+        # Both the note and chord readouts share one hold timer: whichever last had
+        # something to show keeps showing it briefly after the signal drops out,
+        # rather than blanking the instant a decaying note or chord falls below the
+        # gate — see METER_HOLD_MS.
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._clear_display)
+
     def on_pitch(self, result) -> None:
         if not self.active:
             return
         result = self._smoother.push(result)
         if result is None:
-            self.meter.set_cents(None)
-            if not self._note_active:
-                self.detail.setText("Play a note or strum a chord")
             return
+        self._hold_timer.start(METER_HOLD_MS)
         self.meter.set_cents(result.cents)
         self.detail.setText(
             f"{result.freq:.2f} Hz · {result.cents:+.1f} cents · "
@@ -245,6 +273,7 @@ class FreeDetectPanel(ModePanel):
             return
         self._note_active = True
         self._chord_gate.reset()
+        self._hold_timer.start(METER_HOLD_MS)
         self.note_label.show_text(result.name, theme.DETECTED)
         self.highlight_requested.emit(result.pitch_class)
         self.chord_highlight_requested.emit(None)
@@ -253,10 +282,10 @@ class FreeDetectPanel(ModePanel):
     def on_note_released(self) -> None:
         if not self.active:
             return
+        # Only flips the note/chord arbitration flag immediately, so chord matching
+        # can resume promptly; the visible readout is left to the hold timer, same as
+        # a decaying chord or a quiet frame from on_pitch.
         self._note_active = False
-        self.note_label.show_text(None)
-        self.highlight_requested.emit(None)
-        self.detail.setText("Play a note or strum a chord")
 
     def on_bass(self, pitch_class) -> None:
         self._bass = pitch_class
@@ -267,6 +296,7 @@ class FreeDetectPanel(ModePanel):
         match = self._chord_gate.push(chroma, self._bass)
         if match is None:
             return
+        self._hold_timer.start(METER_HOLD_MS)
         self.note_label.show_text(match.chord.name(), theme.TARGET)
         self.detail.setText(f"Chord — {match.score:.0%} match")
         self.chord_highlight_requested.emit(list(match.chord.pitch_classes))
@@ -278,13 +308,20 @@ class FreeDetectPanel(ModePanel):
             del self._recent[:-12]
             self.history.setText("  ".join(self._recent))
 
+    def _clear_display(self) -> None:
+        self.note_label.show_text(None)
+        self.meter.set_cents(None)
+        self.detail.setText("Play a note or strum a chord")
+        self.highlight_requested.emit(None)
+        self.chord_highlight_requested.emit(None)
+
     def on_deactivated(self) -> None:
         super().on_deactivated()
         self._note_active = False
         self._chord_gate.reset()
         self._smoother.reset()
-        self.highlight_requested.emit(None)
-        self.chord_highlight_requested.emit(None)
+        self._hold_timer.stop()
+        self._clear_display()
 
 
 class PracticePanel(ModePanel):
@@ -326,11 +363,17 @@ class PracticePanel(ModePanel):
 
     def _build_ui(self) -> None:
         self.prompt_label = BigNoteLabel("Ready")
+        self._prompt_animation = fade_in(self.prompt_label, duration_ms=240)
+
+        self.previous_widget = CaptionedLabel("Previous")
+        self.next_widget = CaptionedLabel("Next")
+
         self.feedback = QLabel("Press Start")
         self.feedback.setAlignment(Qt.AlignmentFlag.AlignCenter)
         font = QFont(self.feedback.font())
         font.setPointSize(14)
         self.feedback.setFont(font)
+        self._feedback_animation = fade_in(self.feedback, duration_ms=180)
 
         self.countdown = QProgressBar()
         self.countdown.setTextVisible(False)
@@ -360,11 +403,20 @@ class PracticePanel(ModePanel):
         buttons.addWidget(self.skip_button)
         buttons.addStretch(1)
 
+        prompt_row = QHBoxLayout()
+        prompt_row.addStretch(2)
+        prompt_row.addWidget(self.previous_widget)
+        prompt_row.addStretch(1)
+        prompt_row.addWidget(self.prompt_label)
+        prompt_row.addStretch(1)
+        prompt_row.addWidget(self.next_widget)
+        prompt_row.addStretch(2)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self._timing_controls())
         layout.addWidget(self.challenge_selector())
         layout.addStretch(1)
-        layout.addWidget(self.prompt_label)
+        layout.addLayout(prompt_row)
         layout.addWidget(self.countdown)
         layout.addWidget(self.feedback)
         layout.addWidget(self.beat_label)
@@ -486,6 +538,8 @@ class PracticePanel(ModePanel):
         self.countdown.hide()
         self.beat_label.setText("")
         self.prompt_label.show_text("Ready")
+        self.previous_widget.set_text(None)
+        self.next_widget.set_text(None)
         self.feedback.setText("Press Start")
         self.feedback.setStyleSheet(f"color: {theme.TEXT.name()};")
         self.highlight_requested.emit(None)
@@ -496,7 +550,19 @@ class PracticePanel(ModePanel):
 
     def _on_challenge(self, challenge) -> None:
         self.prompt_label.show_text(challenge.prompt, theme.TARGET)
+        self._prompt_animation.stop()
+        self._prompt_animation.start()
+        self._update_lookahead()
         self.on_new_challenge(challenge)
+
+    def _update_lookahead(self) -> None:
+        if not self.engine:
+            return
+        self.previous_widget.set_text(
+            self.engine.previous.prompt if self.engine.previous else None
+        )
+        upcoming = self.engine.upcoming(1)
+        self.next_widget.set_text(upcoming[0].prompt if upcoming else None)
 
     def on_new_challenge(self, challenge) -> None:
         """Hook for subclasses to update the fretboard or other hints."""
@@ -512,6 +578,8 @@ class PracticePanel(ModePanel):
         else:
             self.feedback.setText(f"Skipped {attempt.prompt}")
             self.feedback.setStyleSheet(f"color: {theme.TEXT_DIM.name()};")
+        self._feedback_animation.stop()
+        self._feedback_animation.start()
 
         self.attempt_recorded.emit(attempt)
         self._update_score()
@@ -565,6 +633,7 @@ class PracticePanel(ModePanel):
 
     def _on_timing_changed(self) -> None:
         self.config.rhythm_mode = self.rhythm_radio.isChecked()
+        self.config_changed.emit()
         self._update_rhythm_controls()
         if self.running:
             # Restart so the new timing applies immediately rather than next session.
@@ -573,6 +642,7 @@ class PracticePanel(ModePanel):
 
     def _on_bpm_changed(self, value: int) -> None:
         self.config.bpm = value
+        self.config_changed.emit()
         self.metronome.bpm = value
         if self.engine and self.engine.timeout_seconds is not None:
             self.engine.timeout_seconds = (
@@ -581,12 +651,14 @@ class PracticePanel(ModePanel):
 
     def _on_beats_changed(self, value: int) -> None:
         self.config.beats_per_challenge = value
+        self.config_changed.emit()
         self.beat_counter = BeatCounter(value)
         if self.engine and self.engine.timeout_seconds is not None:
             self.engine.timeout_seconds = self.metronome.seconds_per_beat * value
 
     def _on_mute_changed(self, muted: bool) -> None:
         self.config.metronome_muted = muted
+        self.config_changed.emit()
         self.metronome.muted = muted
 
 
@@ -625,6 +697,7 @@ class NotePracticePanel(PracticePanel):
 
     def _on_set_changed(self, text: str) -> None:
         self.config.note_set = text
+        self.config_changed.emit()
         self._sync_checks()
 
     def _sync_checks(self) -> None:
@@ -643,6 +716,7 @@ class NotePracticePanel(PracticePanel):
         self.config.custom_note_set = [
             pc for pc, check in self.note_checks.items() if check.isChecked()
         ]
+        self.config_changed.emit()
 
     def build_challenges(self) -> list[NoteChallenge]:
         text = self.note_set_combo.currentText()
@@ -747,6 +821,7 @@ class ChordPracticePanel(PracticePanel):
             else:
                 self._selected.discard(symbol)
         self.config.chord_symbols = sorted(self._selected)
+        self.config_changed.emit()
         self._update_selection_label()
 
     def _select_common(self) -> None:
@@ -755,10 +830,12 @@ class ChordPracticePanel(PracticePanel):
         self._selected.update(default_chord_symbols())
         self._refresh_chord_grid()
         self.config.chord_symbols = sorted(self._selected)
+        self.config_changed.emit()
 
     def _clear_selection(self) -> None:
         self._selected.clear()
         self.config.chord_symbols = []
+        self.config_changed.emit()
         self._refresh_chord_grid()
 
     def _update_selection_label(self) -> None:

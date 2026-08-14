@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from guitar_trainer.audio.metronome import (
+    DOWNBEAT_HZ,
     BeatCounter,
     Metronome,
     render_click,
@@ -122,6 +123,71 @@ class TestChallengePicker:
         picker.next()
         picker.reset()
         assert picker._previous is None
+        assert len(picker._queue) == 0
+
+    def test_peek_matches_what_next_later_returns(self):
+        """The whole point of peeking: it must not be a guess that turns out wrong."""
+        picker = ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0))
+        peeked = picker.peek(1)
+        assert picker.next() == peeked
+
+    def test_peek_is_stable_across_repeated_calls(self):
+        picker = ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0))
+        first = picker.peek(1)
+        second = picker.peek(1)
+        assert first == second
+
+    def test_peek_ahead_further(self):
+        picker = ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0))
+        two_ahead = picker.peek(2)
+        picker.next()
+        one_ahead = picker.peek(1)
+        assert one_ahead == two_ahead
+
+    def test_peek_does_not_repeat_the_currently_queued_item(self):
+        """Peeking ahead must respect the same no-immediate-repeat rule as next()."""
+        picker = ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0))
+        for _ in range(50):
+            first, second = picker.peek(1), picker.peek(2)
+            assert first != second
+            picker.next()
+
+    def test_peek_on_a_single_challenge_set_still_returns_it(self):
+        picker = ChallengePicker([NoteChallenge(0)], rng=random.Random(0))
+        assert picker.peek(1).pitch_class == 0
+        assert picker.peek(2).pitch_class == 0
+
+    def test_peek_zero_or_negative_returns_none(self):
+        picker = ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0))
+        assert picker.peek(0) is None
+        assert picker.peek(-1) is None
+
+    def test_reset_clears_pending_peeks(self):
+        picker = ChallengePicker(note_challenges(ALL_NOTES), rng=random.Random(0))
+        first = picker.peek(1)
+        picker.reset()
+        second = picker.peek(1)
+        # Not guaranteed to differ (same RNG could repeat), but the queue itself must
+        # have been rebuilt from scratch, not just left as-is.
+        assert len(picker._queue) == 1
+        assert picker._previous is second
+
+    def test_weighting_applies_to_peeked_items_too(self):
+        """peek() must generate through the same weighted path next() uses, not a
+        plain uniform fallback that would make the preview lie about what's likely."""
+        challenges = note_challenges(NoteSet("test", (0, 2, 4)))
+        weak = challenges[0].key
+        picker = ChallengePicker(
+            challenges, rng=random.Random(1), weight_fn=lambda key: 20.0 if key == weak else 1.0
+        )
+        counts = {}
+        for _ in range(300):
+            key = picker.peek(1).key
+            counts[key] = counts.get(key, 0) + 1
+            picker.next()
+        # No-immediate-repeat caps any single challenge at every other pick (three
+        # candidates here), so compare against each individual rival, not their sum.
+        assert all(counts.get(weak, 0) > v for k, v in counts.items() if k != weak)
 
 
 class TestSessionEngineFreeMode:
@@ -201,6 +267,57 @@ class TestSessionEngineFreeMode:
         engine.submit(pitch(60 + challenge.pitch_class))
         assert len(presented) == 2  # first challenge, plus the next one
         assert len(results) == 1
+
+    def test_no_previous_before_the_first_challenge(self):
+        engine = self.make()
+        assert engine.previous is None
+        engine.start()
+        assert engine.previous is None
+
+    def test_previous_tracks_what_was_just_current(self):
+        engine = self.make()
+        first = engine.start()
+        engine.submit(pitch(60 + first.pitch_class))
+        assert engine.previous is first
+        assert engine.current is not first
+
+    def test_previous_advances_each_round(self):
+        engine = self.make()
+        first = engine.start()
+        engine.submit(pitch(60 + first.pitch_class))
+        second = engine.current
+        engine.submit(pitch(60 + second.pitch_class))
+        assert engine.previous is second
+
+    def test_previous_reset_on_restart(self):
+        engine = self.make()
+        first = engine.start()
+        engine.submit(pitch(60 + first.pitch_class))
+        engine.start()  # a fresh session
+        assert engine.previous is None
+
+    def test_upcoming_matches_what_actually_comes_next(self):
+        engine = self.make()
+        challenge = engine.start()
+        [expected] = engine.upcoming(1)
+        engine.submit(pitch(60 + challenge.pitch_class))
+        assert engine.current == expected
+
+    def test_upcoming_multiple(self):
+        engine = self.make()
+        engine.start()
+        assert len(engine.upcoming(3)) == 3
+
+    def test_upcoming_zero_returns_empty(self):
+        engine = self.make()
+        engine.start()
+        assert engine.upcoming(0) == []
+
+    def test_upcoming_before_start_is_still_answerable(self):
+        """The picker exists before start(); peeking must not require an active
+        session (used by the UI to prime the preview before Start is pressed)."""
+        engine = self.make()
+        assert len(engine.upcoming(1)) == 1
 
 
 class TestSessionEngineRhythmMode:
@@ -339,6 +456,52 @@ class TestMetronome:
         intervals = np.diff(onsets)
         assert np.all(intervals == samples_per_beat), f"uneven beats: {set(intervals)}"
         assert onsets[-1] - onsets[0] == 19 * samples_per_beat
+
+    def test_click_is_not_truncated_at_a_block_boundary(self):
+        """Regression test: a click (25ms/1200 samples) is longer than a typical
+        output block (512 samples/~11ms), so most clicks span two or three callbacks.
+        The old implementation dropped whatever didn't fit in the current block,
+        chopping almost every click off mid-decay — audible as a harsh, distorted
+        tick instead of a clean one. The full waveform must now always play out,
+        wherever within a block it happens to start.
+        """
+        sr, bpm, blocksize = 48000, 100, 256  # a small block to force many splits
+        m = Metronome(sample_rate=sr, bpm=bpm, blocksize=blocksize)
+        expected = render_click(DOWNBEAT_HZ, sr)  # beat 0 is always a downbeat
+
+        total_blocks = int(2 * sr / blocksize)
+        rendered = np.zeros(total_blocks * blocksize, dtype=np.float32)
+        for i in range(total_blocks):
+            block = np.zeros((blocksize, 1), dtype=np.float32)
+            m._callback(block, blocksize, None, None)
+            rendered[i * blocksize : (i + 1) * blocksize] = block[:, 0]
+
+        # render_click's first sample is exactly 0.0 (the ramp-in start), so the
+        # true onset is one sample before the first sample this threshold catches.
+        onset = int(np.flatnonzero(np.abs(rendered) > 1e-9)[0]) - 1
+        played = rendered[onset : onset + len(expected)]
+        assert len(played) == len(expected)
+        np.testing.assert_allclose(played, expected, atol=1e-6)
+
+    @pytest.mark.parametrize("blocksize", [64, 128, 256, 400, 512, 1024])
+    def test_click_survives_every_block_size(self, blocksize):
+        """The split point between blocks shifts with blocksize; every alignment
+        must still produce the full, undamaged click rather than just the common
+        default of 512."""
+        sr = 48000
+        m = Metronome(sample_rate=sr, bpm=90, blocksize=blocksize)
+        expected = render_click(DOWNBEAT_HZ, sr)
+
+        total_blocks = int(2 * sr / blocksize) + 1
+        rendered = np.zeros(total_blocks * blocksize, dtype=np.float32)
+        for i in range(total_blocks):
+            block = np.zeros((blocksize, 1), dtype=np.float32)
+            m._callback(block, blocksize, None, None)
+            rendered[i * blocksize : (i + 1) * blocksize] = block[:, 0]
+
+        onset = int(np.flatnonzero(np.abs(rendered) > 1e-9)[0]) - 1
+        played = rendered[onset : onset + len(expected)]
+        np.testing.assert_allclose(played, expected, atol=1e-6)
 
     def test_beat_index_advances(self):
         m = Metronome(sample_rate=48000, bpm=120, blocksize=512)

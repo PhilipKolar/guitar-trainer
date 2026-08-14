@@ -43,6 +43,13 @@ class MainWindow(QMainWindow):
         self._calibrating = False
         self._calibration_samples: list[float] = []
 
+        # Debounced prompt-save, triggered by _mark_dirty() from every settings
+        # change. Must exist before the panels are built, since wiring them up
+        # connects their config_changed signal to it.
+        self._dirty_timer = QTimer(self)
+        self._dirty_timer.setSingleShot(True)
+        self._dirty_timer.timeout.connect(self._save_config)
+
         self.fretboard = FretboardWidget(self.config.tuning())
         self.fretboard.set_label_mode(self._label_mode_from_config())
         self.fretboard.set_use_flats(self.config.use_flats)
@@ -54,8 +61,8 @@ class MainWindow(QMainWindow):
         self.analysis: AnalysisThread | None = None
         self._start_analysis()
 
-        # Persist settings periodically so a crash doesn't lose the whole session's
-        # configuration; also saved on close.
+        # Fallback safety net in case a change is ever made without going through
+        # _mark_dirty(); the debounced save above is what actually covers normal use.
         self._save_timer = QTimer(self)
         self._save_timer.setInterval(30_000)
         self._save_timer.timeout.connect(self._save_config)
@@ -80,6 +87,7 @@ class MainWindow(QMainWindow):
         for panel in self.panels:
             panel.highlight_requested.connect(self.fretboard.set_detected_pitch_class)
             panel.chord_highlight_requested.connect(self._on_chord_highlight)
+            panel.config_changed.connect(self._mark_dirty)
 
         for panel in (self.note_practice, self.chord_practice):
             panel.attempt_recorded.connect(self._record_attempt)
@@ -319,14 +327,17 @@ class MainWindow(QMainWindow):
     def _on_device_changed(self) -> None:
         self.config.device_name = self.device_combo.currentText()
         self._restart_analysis()
+        self._mark_dirty()
 
     def _on_tuning_changed(self, name: str) -> None:
         self.config.tuning_name = name
         self._apply_tuning()
+        self._mark_dirty()
 
     def _on_fret_count_changed(self, value: int) -> None:
         self.config.fret_count = value
         self._apply_tuning()
+        self._mark_dirty()
 
     def _apply_tuning(self) -> None:
         tuning: Tuning = self.config.tuning()
@@ -336,12 +347,14 @@ class MainWindow(QMainWindow):
     def _on_label_mode_changed(self, text: str) -> None:
         self.config.label_mode = text
         self.fretboard.set_label_mode(self._label_mode_from_config())
+        self._mark_dirty()
 
     def _on_gate_changed(self, value: float) -> None:
         self.config.noise_gate = value
         self.level_meter.set_threshold(value)
         if self.analysis:
             self.analysis.worker.set_noise_gate(value)
+        self._mark_dirty()
 
     def _start_gate_calibration(self) -> None:
         if not self.analysis:
@@ -369,10 +382,24 @@ class MainWindow(QMainWindow):
         self.config.min_harmonic_ratio = value
         if self.analysis:
             self.analysis.worker.set_min_harmonic_ratio(value)
+        self._mark_dirty()
 
     def _on_flats_toggled(self, use_flats: bool) -> None:
         self.config.use_flats = use_flats
         self.fretboard.set_use_flats(use_flats)
+        self._mark_dirty()
+
+    def _mark_dirty(self) -> None:
+        """Schedule a prompt save, debounced so a burst of changes — dragging a
+        spinbox, ticking several checkboxes — writes once rather than on every tick.
+
+        This is what makes selections survive anything short of a hard kill: closing
+        the window and the periodic timer both already saved, but neither helps if the
+        app is stopped seconds after a change (Ctrl-C used to skip the save entirely —
+        see the SIGINT handler in __main__.py — and the old 30s timer alone left a
+        window where a quick change-then-close would still lose the change).
+        """
+        self._dirty_timer.start(400)
 
     def _save_config(self) -> None:
         try:
