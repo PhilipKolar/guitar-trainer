@@ -39,10 +39,11 @@ class FretboardWidget(QWidget):
     position_clicked = Signal(int, int)
 
     #: Left/right/top/bottom padding around the board, in pixels.
-    MARGIN_LEFT = 46
+    #: Left margin holds the open-string labels and the open-string marker dots.
+    MARGIN_LEFT = 74
     MARGIN_RIGHT = 18
-    MARGIN_TOP = 26
-    MARGIN_BOTTOM = 26
+    MARGIN_TOP = 30
+    MARGIN_BOTTOM = 30
 
     def __init__(self, tuning: Tuning = STANDARD, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -112,10 +113,22 @@ class FretboardWidget(QWidget):
             max(1.0, self.height() - self.MARGIN_TOP - self.MARGIN_BOTTOM),
         )
 
+    #: Fraction of the drawn width left past the last fret, as on a real neck.
+    TAIL_FRACTION = 0.03
+
     def _fret_xs(self) -> list[float]:
-        """Absolute x of the nut and each fret wire."""
+        """Absolute x of the nut and each fret wire.
+
+        Fret positions are a fraction of the *scale length*, of which a 22-fret neck
+        only spans about 72% — drawing that raw would waste a quarter of the widget on
+        empty board. Scaling so the last fret lands near the right edge preserves the
+        relative spacing that makes the neck recognisable while filling the space.
+        """
         rect = self._board_rect()
-        return [rect.left() + d * rect.width() for d in fret_x_positions(self._tuning.fret_count)]
+        positions = fret_x_positions(self._tuning.fret_count)
+        span = positions[-1] or 1.0
+        usable = rect.width() * (1.0 - self.TAIL_FRACTION)
+        return [rect.left() + (d / span) * usable for d in positions]
 
     def _string_y(self, string: int) -> float:
         """y for a string index. Index 0 is the low string, drawn at the bottom."""
@@ -130,7 +143,8 @@ class FretboardWidget(QWidget):
         """Centre of a fingering dot: between the wires, or on the nut for an open string."""
         xs = self._fret_xs()
         if fret == 0:
-            x = xs[0] - 16
+            # Open strings are marked just left of the nut, clear of the labels.
+            x = xs[0] - 22
         else:
             x = (xs[fret - 1] + xs[fret]) / 2
         return QPointF(x, self._string_y(string))
@@ -214,7 +228,7 @@ class FretboardWidget(QWidget):
             width = 1.0 + 2.0 * (count - 1 - string) / max(1, count - 1)
             painter.setPen(QPen(theme.STRING, width))
             y = self._string_y(string)
-            painter.drawLine(QPointF(rect.left() - 20, y), QPointF(rect.right(), y))
+            painter.drawLine(QPointF(rect.left() - 34, y), QPointF(rect.right(), y))
 
     def _draw_fret_numbers(self, painter: QPainter, rect: QRectF, xs: list[float]) -> None:
         painter.setPen(theme.TEXT_DIM)
@@ -239,7 +253,7 @@ class FretboardWidget(QWidget):
         painter.setFont(font)
         for string in range(self._tuning.string_count):
             painter.drawText(
-                QRectF(0, self._string_y(string) - 9, 30, 18),
+                QRectF(0, self._string_y(string) - 9, 26, 18),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                 self._tuning.string_label(string),
             )

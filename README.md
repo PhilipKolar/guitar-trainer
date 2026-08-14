@@ -36,14 +36,17 @@ python3 -m venv .venv
 ./run.sh
 ```
 
-Pick your input device from the dropdown in the toolbar and check the level meter responds when you
-play. If the meter barely moves, lower the noise gate in Settings; if it's pinned, raise it.
+Pick your input device from the dropdown in the toolbar and check the level meter in the status bar
+responds when you play. The meter's faint vertical marker is the noise gate — set it with the
+**Gate** control in the toolbar so it sits above where the room idles and below where your playing
+peaks. If quiet notes are missed, lower it; if room noise triggers detection, raise it.
 
 ## Development
 
 ```bash
-.venv/bin/pytest              # full suite, no audio hardware needed
-.venv/bin/python -m guitar_trainer.scripts.listen   # CLI pitch-detection smoke test
+.venv/bin/pytest                                     # full suite, no audio hardware needed
+.venv/bin/python -m guitar_trainer.scripts.listen    # CLI pitch-detection smoke test
+.venv/bin/python -m guitar_trainer.scripts.listen --list   # available input devices
 ```
 
 All DSP tests run against synthesised signals, so the suite is deterministic and runs headless in
@@ -59,6 +62,17 @@ buffer. A worker thread runs the analysis and emits results to the UI as queued 
   frames before it counts, which keeps pick attacks and fret noise from registering as notes.
 - **Chords**: a chromagram is matched against templates synthesised from the harmonic series of each
   chord's tones, so recognition works across voicings rather than only the shapes it was tuned on.
+
+## Desktop entry
+
+To add it to the Mint application menu:
+
+```bash
+cp guitar-trainer.desktop ~/.local/share/applications/
+```
+
+Edit the `Exec` and `Path` lines first if the repository lives somewhere other than
+`~/repos/guitar-trainer`.
 
 ## Licence
 

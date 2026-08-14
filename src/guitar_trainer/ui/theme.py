@@ -29,11 +29,15 @@ INCORRECT = QColor("#f87171")
 IN_TUNE = QColor("#4ade80")
 OUT_OF_TUNE = QColor("#f0a742")
 
+#: Base UI font size. Applied as the application font rather than through the
+#: stylesheet: a `font-size` rule in a stylesheet overrides any `setFont` on a widget,
+#: which would silently flatten the large note and prompt readouts back to body text.
+BASE_FONT_POINT_SIZE = 10
+
 STYLESHEET = f"""
 QWidget {{
     background-color: {BACKGROUND.name()};
     color: {TEXT.name()};
-    font-size: 13px;
 }}
 QGroupBox {{
     border: 1px solid #34383e;

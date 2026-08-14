@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Guitar Trainer
+Comment=Practise notes and chords with real-time detection from your microphone
+Exec=/home/phil/repos/guitar-trainer/run.sh
+Path=/home/phil/repos/guitar-trainer
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;Education;
+Keywords=guitar;music;practice;tuner;chords;
