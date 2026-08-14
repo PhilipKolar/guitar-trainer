@@ -55,6 +55,11 @@ class Config:
     # Practice
     note_set: str = "All 12 notes"
     custom_note_set: list[int] = field(default_factory=list)
+    note_accidental_style: str = "sharps"
+    """How accidentals are named in Note practice: "sharps", "flats", or "mix"
+    (each accidental note independently and randomly assigned one or the other,
+    decided fresh each session). Independent of the toolbar's global flats toggle,
+    which only affects the fretboard/tuner labels."""
     chord_symbols: list[str] = field(default_factory=default_chord_symbols)
     bpm: int = 80
     beats_per_challenge: int = 4

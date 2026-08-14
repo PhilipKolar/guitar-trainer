@@ -174,6 +174,25 @@ since the fifth *is* that harmonic. There's no principled fix from chroma alone 
 `test_power_chords_are_an_inherent_ambiguity_not_a_bug` documents this rather than
 asserting either outcome.
 
+**Note practice's accidental-naming style is independent of the toolbar's global
+♭ toggle.** `Config.note_accidental_style` ("sharps" / "flats" / "mix") only affects
+what Note practice prompts with; the toolbar toggle only affects fretboard/tuner
+labels. For "mix", each accidental pitch class gets one random sharp-or-flat coin
+flip *per session* (`NotePracticePanel.build_challenges`), not per occurrence — a
+fresh `NoteChallenge(pc, use_flats=...)` is built with a decided spelling baked in,
+rather than randomising at display time. This was a deliberate simplicity trade-off:
+randomising per-occurrence would mean the same pitch class could be spelled two
+different ways within one session, which either has to be reflected consistently
+everywhere that shows or stores the prompt (main label, previous/next preview,
+feedback text, `Attempt.prompt` in stats) or looks inconsistent between them — and
+`NoteChallenge` is a frozen dataclass whose equality (used by `ChallengePicker` for
+the no-immediate-repeat rule) is derived from all its fields including `use_flats`,
+so two different spellings of the same note would not even compare equal for repeat-
+avoidance purposes. Deciding once per session sidesteps all of that while still being
+a genuine, useful "mixed" set (e.g. C#, Eb, F#, G#, Bb rather than all-sharp or
+all-flat) and lands within the "practice on real hardware" grain of testability the
+rest of the codebase already leans on.
+
 **Rhythm mode scores a correct answer immediately but doesn't advance until the beat
 window elapses.** `SessionEngine.advance_on_correct=False` (set for rhythm mode only,
 in `PracticePanel.start_session`) is what this controls. Originally a correct answer
@@ -287,7 +306,7 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-730 tests, ~10 seconds, no audio hardware and no display required.
+739 tests, ~10 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -424,6 +443,8 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   the actual beat grid every round. `SessionEngine.advance_on_correct=False` now
   scores the answer immediately but waits for the beat window to elapse before
   presenting the next prompt. See the design decision above.
+- Added an accidental-naming option to Note practice: sharps, flats, or mixed at
+  random (one coin flip per accidental, per session). See the design decision above.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:

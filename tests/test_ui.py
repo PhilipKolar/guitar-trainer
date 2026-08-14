@@ -21,6 +21,7 @@ from guitar_trainer.core.notes import (  # noqa: E402
     midi_to_freq,
     name_to_midi,
     name_to_pitch_class,
+    pitch_class_name,
 )
 from guitar_trainer.core.stats import StatsStore  # noqa: E402
 from guitar_trainer.ui.fretboard import FretboardWidget, LabelMode  # noqa: E402
@@ -500,6 +501,73 @@ class TestNotePracticePanel:
         challenges = panel.build_challenges()
         assert len(challenges) == 7
         assert all(c.pitch_class in (0, 2, 4, 5, 7, 9, 11) for c in challenges)
+
+    def test_accidental_style_defaults_to_sharps(self, qapp, config):
+        panel = NotePracticePanel(config)
+        challenges = {c.pitch_class: c for c in panel.build_challenges()}
+        assert challenges[1].prompt == "C#"  # C#/Db
+
+    def test_accidental_style_flats(self, qapp, config):
+        panel = NotePracticePanel(config)
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("flats"))
+        challenges = {c.pitch_class: c for c in panel.build_challenges()}
+        assert challenges[1].prompt == "Db"
+
+    def test_accidental_style_naturals_unaffected_by_flats(self, qapp, config):
+        """Naturals have no accidental to flip either way."""
+        panel = NotePracticePanel(config)
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("flats"))
+        challenges = {c.pitch_class: c for c in panel.build_challenges()}
+        assert challenges[0].prompt == "C"
+        assert challenges[4].prompt == "E"
+
+    def test_accidental_style_mix_only_varies_accidentals(self, qapp, config):
+        panel = NotePracticePanel(config)
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("mix"))
+        challenges = {c.pitch_class: c for c in panel.build_challenges()}
+        # Naturals are never spelled with an accidental regardless of the coin flip.
+        for pc in (0, 2, 4, 5, 7, 9, 11):
+            assert challenges[pc].prompt == pitch_class_name(pc)
+
+    def test_accidental_style_mix_produces_both_spellings_over_many_sessions(self, qapp, config):
+        """Not a fixed 50/50-per-note guarantee (it's one coin flip per note per
+        session), but across many sessions both sharp and flat spellings must appear
+        somewhere for at least one accidental — otherwise "mix" would be a no-op."""
+        panel = NotePracticePanel(config)
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("mix"))
+        accidentals = (1, 3, 6, 8, 10)
+        seen_sharp = seen_flat = False
+        for _ in range(50):
+            challenges = {c.pitch_class: c for c in panel.build_challenges()}
+            for pc in accidentals:
+                if challenges[pc].prompt == pitch_class_name(pc, use_flats=True):
+                    seen_flat = True
+                else:
+                    seen_sharp = True
+        assert seen_sharp and seen_flat
+
+    def test_accidental_style_persists_to_config(self, qapp, config):
+        panel = NotePracticePanel(config)
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("flats"))
+        assert config.note_accidental_style == "flats"
+
+    def test_accidental_style_change_emits_config_changed(self, qapp, config):
+        panel = NotePracticePanel(config)
+        seen = []
+        panel.config_changed.connect(lambda: seen.append(True))
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("mix"))
+        assert seen
+
+    def test_accidental_style_loaded_from_config(self, qapp):
+        config = Config(note_accidental_style="flats")
+        panel = NotePracticePanel(config)
+        assert panel.accidental_combo.currentData() == "flats"
+
+    def test_custom_checkbox_labels_follow_the_selected_style(self, qapp, config):
+        panel = NotePracticePanel(config)
+        assert panel.note_checks[1].text() == "C#"
+        panel.accidental_combo.setCurrentIndex(panel.accidental_combo.findData("flats"))
+        assert panel.note_checks[1].text() == "Db"
 
     def test_deactivation_stops_the_session(self, qapp, config):
         panel = NotePracticePanel(config)

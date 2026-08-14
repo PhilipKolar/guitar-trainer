@@ -13,7 +13,8 @@ playing in real time, and drills you on notes and chords.
 - **Fretboard map** — realistic fret spacing, with note names optionally shown (none / naturals
   only / all notes).
 - **Note practice** — prompts a random note; you play it in any octave. Shows what you just
-  played and what's coming up next, so you can look ahead while you practise.
+  played and what's coming up next, so you can look ahead while you practise. Accidentals can
+  be named as sharps, flats, or mixed at random.
 - **Chord practice** — prompts a random chord from a set you configure, with the same
   previous/next preview.
 - **Timing** — free mode, or rhythm mode driven by an audible metronome at a set BPM.

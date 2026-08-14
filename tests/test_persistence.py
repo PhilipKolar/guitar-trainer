@@ -34,6 +34,7 @@ class TestConfig:
             chord_symbols=["C", "Am", "F#m7"],
             bpm=132,
             rhythm_mode=True,
+            note_accidental_style="mix",
         )
         original.save(path)
         loaded = Config.load(path)

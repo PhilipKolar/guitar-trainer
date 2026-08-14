@@ -694,11 +694,29 @@ class NotePracticePanel(PracticePanel):
         self.note_set_combo.setCurrentIndex(max(0, index))
         self.note_set_combo.currentTextChanged.connect(self._on_set_changed)
 
+        self.accidental_combo = QComboBox()
+        self.accidental_combo.addItem("Sharps (♯)", "sharps")
+        self.accidental_combo.addItem("Flats (♭)", "flats")
+        self.accidental_combo.addItem("Mixed at random", "mix")
+        index = self.accidental_combo.findData(self.config.note_accidental_style)
+        self.accidental_combo.setCurrentIndex(max(0, index))
+        self.accidental_combo.setToolTip(
+            "How accidentals (the black keys) are named when prompted.\n"
+            "Mixed at random picks sharp or flat independently for each accidental\n"
+            "note, decided fresh each time you press Start."
+        )
+        self.accidental_combo.currentIndexChanged.connect(self._on_accidental_style_changed)
+
+        accidental_row = QHBoxLayout()
+        accidental_row.addWidget(QLabel("Accidentals:"))
+        accidental_row.addWidget(self.accidental_combo)
+        accidental_row.addStretch(1)
+
         self.note_checks: dict[int, QCheckBox] = {}
         grid = QGridLayout()
         selected = set(self.config.custom_note_set or range(12))
         for pitch_class in range(12):
-            check = QCheckBox(pitch_class_name(pitch_class, use_flats=self.config.use_flats))
+            check = QCheckBox(pitch_class_name(pitch_class))
             check.setChecked(pitch_class in selected)
             check.toggled.connect(self._on_custom_toggled)
             self.note_checks[pitch_class] = check
@@ -706,16 +724,34 @@ class NotePracticePanel(PracticePanel):
 
         layout = QVBoxLayout()
         layout.addWidget(self.note_set_combo)
+        layout.addLayout(accidental_row)
         layout.addLayout(grid)
         box.setLayout(layout)
 
         self._sync_checks()
+        self._refresh_note_check_labels()
         return box
 
     def _on_set_changed(self, text: str) -> None:
         self.config.note_set = text
         self.config_changed.emit()
         self._sync_checks()
+
+    def _on_accidental_style_changed(self) -> None:
+        self.config.note_accidental_style = self.accidental_combo.currentData()
+        self.config_changed.emit()
+        self._refresh_note_check_labels()
+
+    def _refresh_note_check_labels(self) -> None:
+        """Keep the custom-set checkbox labels in step with the chosen style.
+
+        "Mix" is decided fresh per session rather than per checkbox, so there's no
+        single right label for it here — sharps is shown as a stand-in, same as the
+        default when nothing has been chosen yet.
+        """
+        use_flats = self.accidental_combo.currentData() == "flats"
+        for pitch_class, check in self.note_checks.items():
+            check.setText(pitch_class_name(pitch_class, use_flats=use_flats))
 
     def _sync_checks(self) -> None:
         """Checkboxes double as a display of the preset sets, and as the custom editor."""
@@ -746,7 +782,19 @@ class NotePracticePanel(PracticePanel):
             if not selected:
                 raise ValueError("Select at least one note to practise")
             note_set = NoteSet("Custom", tuple(selected))
-        return note_challenges(note_set, use_flats=self.config.use_flats)
+
+        style = self.accidental_combo.currentData()
+        if style == "mix":
+            # Each accidental gets its own independent coin flip, decided once per
+            # session rather than per occurrence — so the prompt, the previous/next
+            # preview, the feedback text and the stored stats all agree on how a
+            # given note was spelled, instead of a note changing its own name
+            # mid-session.
+            return [
+                NoteChallenge(pc, use_flats=random.random() < 0.5)
+                for pc in note_set.pitch_classes
+            ]
+        return note_challenges(note_set, use_flats=(style == "flats"))
 
     def on_new_challenge(self, challenge) -> None:
         self.highlight_requested.emit(None)
