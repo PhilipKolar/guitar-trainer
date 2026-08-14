@@ -39,6 +39,9 @@ class Config:
     device_name: str | None = None
     """Matched by name rather than index, since indices shift as devices come and go."""
     noise_gate: float = 0.01
+    min_harmonic_ratio: float = 0.6
+    """Mirrors audio.pitch.DEFAULT_MIN_HARMONIC_RATIO; kept independent so core/ has no
+    audio import (see AGENTS.md)."""
 
     # Instrument
     tuning_name: str = STANDARD.name

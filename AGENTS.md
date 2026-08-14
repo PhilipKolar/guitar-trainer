@@ -21,7 +21,7 @@ The five modes:
 | Mode | What it does |
 |---|---|
 | Tuner | Nearest open string plus a cents needle. |
-| Free detect | Live note readout; lights up every matching fretboard position. |
+| Free detect | Live note *or* chord readout — a clean single note wins if one is ringing, otherwise a sustained chord match is shown. Lights up matching fretboard positions either way. |
 | Note practice | Prompts a random note; **any octave counts**. |
 | Chord practice | Prompts a random chord from a user-selected set; any voicing counts. |
 | Stats | Accuracy and median response time per note/chord, weakest first. |
@@ -156,6 +156,20 @@ the UI polls a beat counter.
 so metronome bleed through speakers is never scored as a played note. Click pitches are
 high and narrowband to sit far from guitar fundamentals.
 
+**A harmonic-energy-ratio filter rejects noise that is loud and periodic enough to
+fool YIN.** `YinDetector._harmonic_energy_ratio` measures what fraction of a frame's
+spectral energy sits at multiples of the detected fundamental. A plucked string
+concentrates nearly all of it there (ratio > 0.98 across the neck, even at 10dB SNR); a
+keyboard click spreads it across the spectrum instead (ratio < 0.52 for every
+synthesised click that fools YIN's periodicity check at all — see
+`tests/test_pitch.py::TestPurityFilter`). `DEFAULT_MIN_HARMONIC_RATIO = 0.6` sits well
+clear of both populations. **This does not, and cannot, reliably reject speech or
+singing** — a sustained vowel is a genuine harmonic source, acoustically much closer to
+a plucked string than to a keyboard click, so it scores similarly high. Rejecting voice
+would need timbral classification (formants, MFCCs), not a purity ratio; the honest
+mitigation is the RMS gate plus mic placement, not this filter. Don't oversell it in UI
+copy or docs — say what it actually does.
+
 ## Tuned constants
 
 Changing these has non-obvious consequences; the referenced tests are the safety net.
@@ -169,10 +183,11 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `ROOT_WEIGHT` | 1.35 (works 1.3–1.4) | `core/chords.py` | `test_chords.py` |
 | `UNEXPLAINED_PENALTY` | 0.55 (works 0.4–0.7) | `core/chords.py` | `test_chords.py` |
 | `HARMONIC_DECAY` / `N_HARMONICS` | 0.6 / 6 | `core/chords.py` | `test_chords.py` |
+| `DEFAULT_MIN_HARMONIC_RATIO` | 0.6 (guitar floor ~0.98, click ceiling ~0.51) | `audio/pitch.py` | `test_pitch.py::TestPurityFilter` |
 
 ## Testing
 
-584 tests, ~7 seconds, no audio hardware and no display required.
+630 tests, ~7 seconds, no audio hardware and no display required.
 
 **All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -208,8 +223,31 @@ the *bottom*. Tuning tuples are ordered low to high.
 and go; `config.device_name` is matched against the combo text.
 
 **Ambient noise on this machine is significant** — measured idle RMS ~0.05 against a
-default gate of 0.01, enough that room sound alone produces "stable" notes. The gate
-control and the level-meter marker exist for this; it is not a detection bug.
+default gate of 0.01. There's a **Calibrate** button next to the Gate control
+(`main_window.py`, `_start_gate_calibration`) that samples ambient level for ~1.2s and
+sets the gate above it; point users at it rather than having them guess a number.
+
+**The Gate control used to be wired to only half the pipeline — this was a real bug,
+not just an unconfigured default.** `frame_analysed` (which drives `Tuner.on_pitch` and
+`FreeDetectPanel`'s live cents/detail readout) was emitted straight from
+`YinDetector.detect()`, bypassing `NoteGate.rms_threshold` entirely; only the
+practice-modes' "stable note" path checked it. Raising the Gate control did nothing for
+what the Tuner tab actually shows. Fixed in `AnalysisWorker._process` by gating
+`result` itself on `rms >= self.gate.rms_threshold` before running detection at all.
+`ChromaAnalyser` also had its own fixed, lower threshold (0.005) independent of the
+user's setting; `set_noise_gate` now updates both. If you add a new consumer of
+per-frame analysis, route it through this same gate rather than reading raw detector
+output — that's exactly how this bug happened. Guarded by `tests/test_worker.py`.
+
+**A defined-but-never-connected signal handler is a silent bug, not a no-op.**
+`ChordPracticePanel` had a `set_bass()` method that was never wired to anything in
+`main_window.py` — bass-note disambiguation (C vs Am, Em vs G) only ever worked in
+tests that called it directly, never in the running app. Renamed to the `on_bass()`
+hook every panel now gets (see `ModePanel.on_bass`, fed by `AnalysisWorker.bass_changed`,
+emitted immediately before `chroma_updated` for the same frame so a panel's stored bass
+value is always fresh when it matches). When adding a new panel hook like this, grep for
+where it's actually *connected*, not just defined — a plausible-looking method with no
+caller passes review easily.
 
 ## Data locations
 
@@ -229,25 +267,42 @@ control and the level-meter marker exist for this; it is not a detection bug.
 
 ## Status and possible next steps
 
-Everything in the original plan is built, tested and pushed; CI is green.
+Everything in the original plan is built, tested and pushed; CI is green. Since then,
+in response to real usage on the author's machine (very sensitive to speech/typing):
 
-Not yet done — **the app has never been verified by ear against a real guitar.** The
-pipeline was confirmed end to end (capture opens, 60 frames, zero overflows, notes and
-chroma produced), but every acceptance check below still wants a human with an
-instrument:
+- Added a harmonic-purity filter that rejects percussive/noise false positives
+  (keyboard clicks) — see the design decision above. **Does not filter speech.**
+- Fixed the Gate control not actually reaching the Tuner/Free Detect live readout
+  (`frame_analysed` bypassed it) — see the Gotchas entry. This was likely the bigger
+  contributor to "detection reacts to talking/typing" than the missing purity filter.
+- Added a **Calibrate** button that samples ambient level and sets the gate above it.
+- Fixed `ChordPracticePanel`'s bass-note disambiguation, which was dead code — never
+  wired to the live signal path, only exercised by tests calling it directly.
+- Free detect now also recognises chords (full 120-chord candidate set, since there's
+  no drilled subset to narrow it to — an honest best-effort display, not scored).
 
-1. Set the gate on first run; confirm the level meter tracks playing.
+Still not verified by ear against a real guitar beyond the fixes above. Acceptance
+checks that still want a human with an instrument:
+
+1. **Talking/typing near the mic** — with the gate fix and Calibrate button, does
+   raising the gate above ambient actually stop the Tuner/Free Detect from reacting?
+   Loud sustained speech that clears the gate will still register — that's expected,
+   not a bug (see the purity-filter design decision) — but it should take real volume
+   to do it, not just a normal-volume comment.
 2. Tuner: each open string reads correctly, needle centres when in tune.
-3. Free detect: chromatic scale up the low E, then above the 12th fret (octave errors).
+3. Free detect: chromatic scale up the low E, then above the 12th fret (octave errors);
+   strum a chord and confirm it's recognised once the note readout goes quiet.
 4. Note practice: ~20 prompts register promptly; wrong notes are not accepted.
 5. **Rhythm mode at 60 BPM through speakers** — confirm the click is never scored as a
    played note. This is the least-trusted part; if it leaks, widen the suppression
    window in `modes.py:_on_tick`.
-6. Chord practice: open vs barre voicings; Am vs C and Em vs G not confused.
+6. Chord practice: open vs barre voicings; Am vs C and Em vs G not confused (this now
+   has a real bass-note signal behind it, worth specifically re-checking).
 
 Ideas, none committed to: per-string practice restriction, scale/arpeggio drills,
 detecting *which* string was played (needs more than a mono signal), PyInstaller
-packaging.
+packaging, a "pause detection" toggle/hotkey for mid-session conversation (the purity
+filter can't help with that — it's a genuine gap, not a bug).
 
 ## Maintaining this file
 

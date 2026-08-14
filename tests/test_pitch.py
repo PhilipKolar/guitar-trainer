@@ -112,6 +112,74 @@ class TestRange:
         assert detector.detect(synth.sine(3000.0, duration=0.2)[:WINDOW]) is None
 
 
+class TestPurityFilter:
+    """Rejecting noise that happens to be loud and periodic enough to fool YIN.
+
+    This is what guards against keyboard clicks and other percussive sounds near the
+    mic being reported as played notes. It works because a plucked string concentrates
+    energy at its harmonic series while noise spreads it across the spectrum — see
+    audio/pitch.py's DEFAULT_MIN_HARMONIC_RATIO for the measured separation between the
+    two populations that this threshold was tuned against.
+    """
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_keyboard_clicks_are_rejected(self, detector, seed):
+        click = synth.keyboard_click(seed=seed)
+        padded = np.zeros(WINDOW, dtype=np.float32)
+        n = min(len(click), WINDOW)
+        padded[:n] = click[:n]
+        result = detector.detect(padded)
+        assert result is None, f"click (seed {seed}) was reported as {result.name if result else None}"
+
+    @pytest.mark.parametrize("offset", [0, 512, 1024, 2048])
+    def test_clicks_rejected_at_any_window_offset(self, detector, offset):
+        click = synth.keyboard_click(seed=1)
+        padded = np.zeros(WINDOW, dtype=np.float32)
+        n = min(len(click), WINDOW - offset)
+        padded[offset : offset + n] = click[:n]
+        assert detector.detect(padded) is None
+
+    @pytest.mark.parametrize("note", ["E2", "A2", "D3", "G3", "B3", "E4"])
+    def test_clean_guitar_notes_still_pass(self, detector, note):
+        """The filter must not cost accuracy on the thing it's meant to let through."""
+        midi = name_to_midi(note)
+        signal = synth.plucked_string(midi_to_freq(midi), duration=0.4, attack_noise=0.05)
+        result = detector.detect(signal[2048 : 2048 + WINDOW])
+        assert result is not None
+        assert result.midi == midi
+        assert result.harmonic_ratio > 0.9
+
+    def test_noisy_guitar_notes_still_pass(self, detector):
+        """A guitar note at a realistic SNR shouldn't be caught by a filter meant for
+        noise that has no note underneath it at all."""
+        midi = name_to_midi("A2")
+        signal = synth.add_noise(synth.plucked_string(midi_to_freq(midi), duration=0.4), 15)
+        result = detector.detect(signal[2048 : 2048 + WINDOW])
+        assert result is not None
+        assert result.midi == midi
+
+    def test_pure_white_noise_is_rejected(self, detector):
+        rng = np.random.default_rng(3)
+        noise = rng.normal(0, 0.2, WINDOW).astype(np.float32)
+        assert detector.detect(noise) is None
+
+    def test_ratio_field_reflects_signal_quality(self, detector):
+        clean = detector.detect(synth.sine(220.0, duration=0.2)[:WINDOW])
+        assert clean is not None
+        assert clean.harmonic_ratio > 0.99  # a pure tone is essentially all harmonic
+
+    def test_threshold_is_configurable(self):
+        """A caller that wants the old, more permissive behaviour still can."""
+        lenient = YinDetector(SR, min_harmonic_ratio=0.0)
+        click = synth.keyboard_click(seed=1)
+        padded = np.zeros(WINDOW, dtype=np.float32)
+        padded[: min(len(click), WINDOW)] = click[:WINDOW]
+        # Not asserting it detects something — only that the gate is the thing that
+        # was disabled, i.e. this must not raise and must respect the override.
+        lenient.detect(padded)
+        assert lenient.min_harmonic_ratio == 0.0
+
+
 class TestPitchResult:
     def test_fields_are_consistent(self):
         result = PitchResult.from_freq(440.0, confidence=0.9, rms=0.1)

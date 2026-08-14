@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QSpinBox,
     QTabWidget,
     QToolBar,
@@ -39,6 +40,8 @@ class MainWindow(QMainWindow):
 
         self._session_id: int | None = None
         self._devices = list_input_devices()
+        self._calibrating = False
+        self._calibration_samples: list[float] = []
 
         self.fretboard = FretboardWidget(self.config.tuning())
         self.fretboard.set_label_mode(self._label_mode_from_config())
@@ -76,6 +79,7 @@ class MainWindow(QMainWindow):
         self.panels = [self.tuner, self.free, self.note_practice, self.chord_practice]
         for panel in self.panels:
             panel.highlight_requested.connect(self.fretboard.set_detected_pitch_class)
+            panel.chord_highlight_requested.connect(self._on_chord_highlight)
 
         for panel in (self.note_practice, self.chord_practice):
             panel.attempt_recorded.connect(self._record_attempt)
@@ -159,6 +163,31 @@ class MainWindow(QMainWindow):
         self.gate_spin.valueChanged.connect(self._on_gate_changed)
         toolbar.addWidget(self.gate_spin)
 
+        self.calibrate_button = QPushButton("Calibrate")
+        self.calibrate_button.setToolTip(
+            "Stay quiet for a second (no playing, talking or typing) and this sets\n"
+            "the gate just above whatever the microphone is picking up right now."
+        )
+        self.calibrate_button.clicked.connect(self._start_gate_calibration)
+        toolbar.addWidget(self.calibrate_button)
+
+        toolbar.addWidget(QLabel(" Purity: "))
+        self.purity_spin = QDoubleSpinBox()
+        self.purity_spin.setRange(0.0, 0.95)
+        self.purity_spin.setSingleStep(0.05)
+        self.purity_spin.setDecimals(2)
+        self.purity_spin.setValue(self.config.min_harmonic_ratio)
+        self.purity_spin.setToolTip(
+            "How clean a tone has to be to count as a played note. Higher rejects\n"
+            "sounds that pass the gate but aren't an instrument — keyboard clicks,\n"
+            "knocks, coughs. Lower it if real notes on a noisy or distorted signal\n"
+            "path are being missed. This does not filter out speech or singing —\n"
+            "a voice is genuinely harmonic like a guitar string, so only distance\n"
+            "and the noise gate help with that."
+        )
+        self.purity_spin.valueChanged.connect(self._on_purity_changed)
+        toolbar.addWidget(self.purity_spin)
+
         flats = QAction("♭", self)
         flats.setCheckable(True)
         flats.setChecked(self.config.use_flats)
@@ -193,11 +222,13 @@ class MainWindow(QMainWindow):
         self.analysis = AnalysisThread(capture)
         worker = self.analysis.worker
         worker.set_noise_gate(self.config.noise_gate)
+        worker.set_min_harmonic_ratio(self.config.min_harmonic_ratio)
         worker.frame_analysed.connect(self._on_frame)
         worker.note_stable.connect(self._on_note_stable)
         worker.note_released.connect(self._on_note_released)
+        worker.bass_changed.connect(self._on_bass)
         worker.chroma_updated.connect(self._on_chroma)
-        worker.level_changed.connect(self.level_meter.set_level)
+        worker.level_changed.connect(self._on_level)
         worker.error.connect(self._on_audio_error)
         self.analysis.start()
         self.status_label.setText("Listening")
@@ -233,10 +264,26 @@ class MainWindow(QMainWindow):
             if panel.active:
                 panel.on_note_released()
 
+    def _on_chord_highlight(self, pitch_classes) -> None:
+        if pitch_classes:
+            self.fretboard.set_target_pitch_classes(pitch_classes, color=theme.DETECTED)
+        else:
+            self.fretboard.clear_targets()
+
+    def _on_bass(self, pitch_class) -> None:
+        for panel in self.panels:
+            if panel.active:
+                panel.on_bass(pitch_class)
+
     def _on_chroma(self, chroma) -> None:
         for panel in self.panels:
             if panel.active:
                 panel.on_chroma(chroma)
+
+    def _on_level(self, rms: float) -> None:
+        self.level_meter.set_level(rms)
+        if self._calibrating:
+            self._calibration_samples.append(rms)
 
     def _record_attempt(self, attempt) -> None:
         panel = self.tabs.currentWidget()
@@ -295,6 +342,33 @@ class MainWindow(QMainWindow):
         self.level_meter.set_threshold(value)
         if self.analysis:
             self.analysis.worker.set_noise_gate(value)
+
+    def _start_gate_calibration(self) -> None:
+        if not self.analysis:
+            return
+        self._calibration_samples = []
+        self._calibrating = True
+        self.calibrate_button.setEnabled(False)
+        self.calibrate_button.setText("Listening…")
+        QTimer.singleShot(1200, self._finish_gate_calibration)
+
+    def _finish_gate_calibration(self) -> None:
+        self._calibrating = False
+        self.calibrate_button.setEnabled(True)
+        self.calibrate_button.setText("Calibrate")
+        if not self._calibration_samples:
+            return
+        # A margin above the observed noise floor: played notes peak far higher than
+        # idle room sound, so this rarely needs a manual nudge afterwards.
+        floor = max(self._calibration_samples)
+        gate = floor * 1.8 + 0.002
+        gate = max(self.gate_spin.minimum(), min(self.gate_spin.maximum(), gate))
+        self.gate_spin.setValue(gate)
+
+    def _on_purity_changed(self, value: float) -> None:
+        self.config.min_harmonic_ratio = value
+        if self.analysis:
+            self.analysis.worker.set_min_harmonic_ratio(value)
 
     def _on_flats_toggled(self, use_flats: bool) -> None:
         self.config.use_flats = use_flats

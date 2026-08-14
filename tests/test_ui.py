@@ -231,6 +231,92 @@ class TestFreeDetectPanel:
             panel.on_note_stable(pitch(40 + i))
         assert len(panel._recent) <= 12
 
+    def test_recognises_a_chord(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        chroma = harmonic_template(Chord.parse("Am").pitch_classes)
+        for _ in range(3):
+            panel.on_chroma(chroma)
+        assert panel.note_label.text() == "Am"
+
+    def test_chord_requires_sustained_agreement(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        chroma = harmonic_template(Chord.parse("G").pitch_classes)
+        panel.on_chroma(chroma)
+        assert panel.note_label.text() == "—"
+
+    def test_bass_note_disambiguates_relative_pairs(self, qapp):
+        """C and Am share two of three notes; the wired-through bass is what separates
+        them in the live signal path (this bug existed until now — see AGENTS.md)."""
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        for symbol, bass in [("C", 0), ("Am", 9)]:
+            panel._chord_gate.reset()
+            chroma = harmonic_template(Chord.parse(symbol).pitch_classes)
+            panel.on_bass(bass)
+            for _ in range(3):
+                result = panel.on_chroma(chroma)
+            assert panel.note_label.text() == symbol
+
+    def test_a_ringing_single_note_suppresses_chord_display(self, qapp):
+        """A held note's harmonic leakage can look chord-ish; the clean monophonic
+        read must win rather than being second-guessed by the chroma path."""
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("E3")))
+        chroma = harmonic_template(Chord.parse("Am").pitch_classes)
+        for _ in range(5):
+            panel.on_chroma(chroma)
+        assert panel.note_label.text() == "E3"
+
+    def test_chord_path_resumes_once_the_note_is_released(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        panel.on_note_stable(pitch(name_to_midi("E3")))
+        panel.on_note_released()
+        chroma = harmonic_template(Chord.parse("G").pitch_classes)
+        for _ in range(3):
+            panel.on_chroma(chroma)
+        assert panel.note_label.text() == "G"
+
+    def test_chord_emits_fretboard_highlight(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        seen = []
+        panel.chord_highlight_requested.connect(seen.append)
+        chroma = harmonic_template(Chord.parse("D").pitch_classes)
+        for _ in range(3):
+            panel.on_chroma(chroma)
+        assert seen and sorted(seen[-1]) == sorted(Chord.parse("D").pitch_classes)
+
+    def test_noise_is_not_shown_as_a_chord(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        for _ in range(6):
+            panel.on_chroma(np.full(12, 1 / np.sqrt(12)))
+        assert panel.note_label.text() == "—"
+
+    def test_deactivation_clears_chord_state(self, qapp):
+        panel = FreeDetectPanel()
+        panel.on_activated()
+        chroma = harmonic_template(Chord.parse("Am").pitch_classes)
+        panel.on_chroma(chroma)
+        panel.on_chroma(chroma)
+        panel.on_deactivated()
+        panel.on_activated()
+        # The in-progress streak must not carry over across a deactivation: one more
+        # frame is not enough to settle a chord that hasn't just resumed from scratch.
+        panel.on_chroma(chroma)
+        assert panel.note_label.text() == "—"
+
+    def test_inactive_panel_ignores_chroma(self, qapp):
+        panel = FreeDetectPanel()
+        chroma = harmonic_template(Chord.parse("Am").pitch_classes)
+        for _ in range(3):
+            panel.on_chroma(chroma)
+        assert panel.note_label.text() == "—"
+
 
 class TestNotePracticePanel:
     def test_starts_and_stops(self, qapp, config):
@@ -515,3 +601,77 @@ class TestMainWindow:
             window.close()
 
         assert Config.load(config_path).fret_count == 24
+
+    def test_purity_control_updates_config(self, qapp, tmp_path, monkeypatch):
+        import guitar_trainer.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "list_input_devices", lambda: [])
+        with StatsStore(tmp_path / "s.db") as store:
+            window = mw.MainWindow(Config(), store)
+            window.purity_spin.setValue(0.75)
+            assert window.config.min_harmonic_ratio == pytest.approx(0.75)
+            window.analysis = None
+            window.close()
+
+    def test_calibrate_is_a_noop_without_a_running_stream(self, qapp, tmp_path, monkeypatch):
+        import guitar_trainer.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "list_input_devices", lambda: [])
+        with StatsStore(tmp_path / "s.db") as store:
+            window = mw.MainWindow(Config(), store)
+            window._start_gate_calibration()
+            assert not window._calibrating
+            window.analysis = None
+            window.close()
+
+    def test_calibrate_sets_gate_above_the_observed_floor(self, qapp, tmp_path, monkeypatch):
+        import guitar_trainer.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "list_input_devices", lambda: [])
+        with StatsStore(tmp_path / "s.db") as store:
+            window = mw.MainWindow(Config(), store)
+
+            class _FakeWorker:
+                def set_noise_gate(self, value):
+                    pass
+
+            class _FakeAnalysis:
+                worker = _FakeWorker()
+
+            window.analysis = _FakeAnalysis()  # truthy, and tolerates the gate setter
+            window._calibrating = True
+            window._calibration_samples = [0.01, 0.03, 0.02]
+            window._finish_gate_calibration()
+            assert window.gate_spin.value() > 0.03
+            assert not window._calibrating
+            assert window.calibrate_button.isEnabled()
+            window.analysis = None
+            window.close()
+
+    def test_calibrate_with_no_samples_leaves_gate_unchanged(self, qapp, tmp_path, monkeypatch):
+        import guitar_trainer.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "list_input_devices", lambda: [])
+        with StatsStore(tmp_path / "s.db") as store:
+            window = mw.MainWindow(Config(), store)
+            before = window.gate_spin.value()
+            window._calibrating = True
+            window._calibration_samples = []
+            window._finish_gate_calibration()
+            assert window.gate_spin.value() == before
+            window.analysis = None
+            window.close()
+
+    def test_level_updates_feed_calibration_only_while_calibrating(self, qapp, tmp_path, monkeypatch):
+        import guitar_trainer.ui.main_window as mw
+
+        monkeypatch.setattr(mw, "list_input_devices", lambda: [])
+        with StatsStore(tmp_path / "s.db") as store:
+            window = mw.MainWindow(Config(), store)
+            window._on_level(0.02)
+            assert window._calibration_samples == []
+            window._calibrating = True
+            window._on_level(0.03)
+            assert window._calibration_samples == [0.03]
+            window.analysis = None
+            window.close()

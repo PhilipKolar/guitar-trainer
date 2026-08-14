@@ -26,6 +26,10 @@ class AnalysisWorker(QObject):
     note_released = Signal()
     #: Normalised chroma vector, for chord matching.
     chroma_updated = Signal(object)  # np.ndarray
+    #: Pitch class of the lowest clearly-sounding partial, or None. Always emitted
+    #: immediately before chroma_updated for the same frame, so a slot that stores it
+    #: and one that consumes it can rely on the value being current.
+    bass_changed = Signal(object)  # int | None
     #: Input level, for the meter.
     level_changed = Signal(float)
     #: Something went wrong opening or reading the stream.
@@ -54,6 +58,12 @@ class AnalysisWorker(QObject):
 
     def set_noise_gate(self, rms_threshold: float) -> None:
         self.gate.rms_threshold = rms_threshold
+        # Chord recognition (chroma) had its own fixed, much lower threshold; tying it
+        # to the same user-configurable gate means calibrating once covers both paths.
+        self.chroma.rms_threshold = rms_threshold
+
+    def set_min_harmonic_ratio(self, ratio: float) -> None:
+        self.detector.min_harmonic_ratio = ratio
 
     def suppress_until(self, monotonic_time: float) -> None:
         """Ignore input up to a point in time.
@@ -106,7 +116,15 @@ class AnalysisWorker(QObject):
         if now < self._suppress_until:
             return
 
-        result: PitchResult | None = self.detector.detect(frame)
+        # Below the configured gate, don't even run detection — this is what makes
+        # the Gate control actually mean something for the Tuner and Free Detect live
+        # readouts. Previously only the practice modes' "stable note" scoring checked
+        # it; the raw per-frame result shown here bypassed it entirely, so quiet
+        # keyboard clicks and talking still lit up the tuner needle and note readout
+        # no matter how the gate was set.
+        result: PitchResult | None = (
+            self.detector.detect(frame) if rms >= self.gate.rms_threshold else None
+        )
         self.frame_analysed.emit(result)
 
         stable = self.gate.push(result)
@@ -119,6 +137,7 @@ class AnalysisWorker(QObject):
 
         chroma = self.chroma.analyse(frame)
         if chroma is not None:
+            self.bass_changed.emit(self.chroma.bass_pitch_class(frame))
             self.chroma_updated.emit(chroma)
 
 

@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..audio.metronome import MAX_BPM, MIN_BPM, BeatCounter, Metronome
-from ..core.chords import CHORD_QUALITIES, QUALITY_SUFFIX, Chord, ChordMatcher, all_chords
+from ..core.chords import CHORD_QUALITIES, QUALITY_SUFFIX, Chord, ChordGate, ChordMatcher, all_chords
 from ..core.notes import (
     ALL_NOTES,
     NATURAL_NOTES,
@@ -60,8 +60,10 @@ class ModePanel(QWidget):
     practice modes, would score answers the user can't see.
     """
 
-    #: Ask the main window to highlight a pitch class on the shared fretboard.
+    #: Ask the main window to highlight a single pitch class on the shared fretboard.
     highlight_requested = Signal(object)  # int | None
+    #: Ask the main window to highlight a set of pitch classes, e.g. a recognised chord.
+    chord_highlight_requested = Signal(object)  # list[int] | None
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -84,6 +86,13 @@ class ModePanel(QWidget):
 
     def on_chroma(self, chroma) -> None:
         """A chroma vector, for chord recognition."""
+
+    def on_bass(self, pitch_class) -> None:
+        """Pitch class of the lowest clearly-sounding partial, or ``None``.
+
+        Always delivered for a frame before that frame's ``on_chroma``, so a chord
+        matcher can read it fresh when disambiguating relative pairs like C/Am.
+        """
 
 
 class TunerPanel(ModePanel):
@@ -162,7 +171,20 @@ class TunerPanel(ModePanel):
 
 
 class FreeDetectPanel(ModePanel):
-    """Live readout of whatever is being played."""
+    """Live readout of whatever is being played — a single note, or a chord.
+
+    Both detection streams run all the time; which one is shown is decided by whether a
+    single note is currently ringing cleanly. A held note's chroma still has leakage
+    onto its fifth and third from string harmonics, which can look enough like a chord
+    to the matcher that showing both at once would be more confusing than useful — so
+    a clean single note always wins, and the chord path only speaks once it's gone
+    quiet on the monophonic side.
+    """
+
+    #: Chord matching runs against every chord, since there's no drilled set to narrow
+    #: it to here — see AGENTS.md on why that makes it inherently more error-prone than
+    #: chord practice mode. Kept as an honest best-effort informational display.
+    _CHORD_MATCHER = ChordMatcher(all_chords())
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -170,7 +192,7 @@ class FreeDetectPanel(ModePanel):
         self.note_label = BigNoteLabel("—")
         self.meter = CentsMeter()
 
-        self.detail = QLabel("Play a note")
+        self.detail = QLabel("Play a note or strum a chord")
         self.detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detail.setStyleSheet(f"color: {theme.TEXT_DIM.name()};")
 
@@ -191,13 +213,17 @@ class FreeDetectPanel(ModePanel):
         layout.addWidget(self.history)
 
         self._recent: list[str] = []
+        self._note_active = False
+        self._bass: int | None = None
+        self._chord_gate = ChordGate(self._CHORD_MATCHER)
 
     def on_pitch(self, result) -> None:
         if not self.active:
             return
         if result is None:
             self.meter.set_cents(None)
-            self.detail.setText("Play a note")
+            if not self._note_active:
+                self.detail.setText("Play a note or strum a chord")
             return
         self.meter.set_cents(result.cents)
         self.detail.setText(
@@ -208,23 +234,47 @@ class FreeDetectPanel(ModePanel):
     def on_note_stable(self, result) -> None:
         if not self.active:
             return
+        self._note_active = True
+        self._chord_gate.reset()
         self.note_label.show_text(result.name, theme.DETECTED)
         self.highlight_requested.emit(result.pitch_class)
-
-        if not self._recent or self._recent[-1] != result.note_only:
-            self._recent.append(result.note_only)
-            del self._recent[:-12]
-            self.history.setText("  ".join(self._recent))
+        self.chord_highlight_requested.emit(None)
+        self._append_history(result.note_only)
 
     def on_note_released(self) -> None:
         if not self.active:
             return
+        self._note_active = False
         self.note_label.show_text(None)
         self.highlight_requested.emit(None)
+        self.detail.setText("Play a note or strum a chord")
+
+    def on_bass(self, pitch_class) -> None:
+        self._bass = pitch_class
+
+    def on_chroma(self, chroma) -> None:
+        if not self.active or self._note_active:
+            return
+        match = self._chord_gate.push(chroma, self._bass)
+        if match is None:
+            return
+        self.note_label.show_text(match.chord.name(), theme.TARGET)
+        self.detail.setText(f"Chord — {match.score:.0%} match")
+        self.chord_highlight_requested.emit(list(match.chord.pitch_classes))
+        self._append_history(f"({match.chord.name()})")
+
+    def _append_history(self, label: str) -> None:
+        if not self._recent or self._recent[-1] != label:
+            self._recent.append(label)
+            del self._recent[:-12]
+            self.history.setText("  ".join(self._recent))
 
     def on_deactivated(self) -> None:
         super().on_deactivated()
+        self._note_active = False
+        self._chord_gate.reset()
         self.highlight_requested.emit(None)
+        self.chord_highlight_requested.emit(None)
 
 
 class PracticePanel(ModePanel):
@@ -750,5 +800,5 @@ class ChordPracticePanel(PracticePanel):
         if self._streak >= 3:
             self.engine.submit(match, label=match.chord.name())
 
-    def set_bass(self, pitch_class: int | None) -> None:
+    def on_bass(self, pitch_class) -> None:
         self._last_bass = pitch_class

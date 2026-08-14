@@ -74,6 +74,28 @@ def plucked_string(
     return (amplitude * out).astype(np.float32)
 
 
+def keyboard_click(
+    duration: float = 0.15, sr: int = SAMPLE_RATE, amplitude: float = 0.3, seed: int = 0
+):
+    """A short broadband transient, roughly like a mechanical key switch.
+
+    Modelled as noise with a couple of resonant "knocks" riding on a fast decay — some
+    tonal colour, the way a physical switch has a characteristic pitch without being
+    remotely harmonic, but mostly energy spread across the spectrum rather than
+    concentrated in a series. This is what the harmonic-purity filter is meant to
+    reject even when a click is loud and periodic enough to otherwise fool YIN.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(duration * sr)
+    t = np.arange(n) / sr
+    envelope = np.exp(-t * 400.0)
+    click = rng.normal(0, 1, n) * envelope
+    for freq, decay in [(1800.0, 250.0), (3200.0, 300.0)]:
+        click += 0.3 * np.sin(2 * np.pi * freq * t) * np.exp(-t * decay)
+    click /= np.max(np.abs(click)) + 1e-9
+    return (amplitude * click).astype(np.float32)
+
+
 def add_noise(signal: np.ndarray, snr_db: float, seed: int = 0) -> np.ndarray:
     """Mix in white noise at a given signal-to-noise ratio."""
     rng = np.random.default_rng(seed)

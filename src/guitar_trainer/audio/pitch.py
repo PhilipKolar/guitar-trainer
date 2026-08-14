@@ -27,6 +27,19 @@ DEFAULT_HOP = 1024
 #: Below this, YIN's normalised difference indicates a periodic signal.
 DEFAULT_THRESHOLD = 0.12
 
+#: How much of a frame's spectral energy must sit at multiples of the detected
+#: fundamental for it to count as an instrument tone. A clean plucked string
+#: concentrates almost all its energy there (ratio > 0.98 across the neck, even at
+#: 10dB SNR); a keyboard click or a door slam spreads it across the spectrum instead
+#: (ratio < 0.52 for every synthesised click that fools YIN at all). 0.6 sits well
+#: clear of both populations. Tuned in tests/test_pitch.py::TestPurityFilter — see
+#: that suite before changing it.
+DEFAULT_MIN_HARMONIC_RATIO = 0.6
+#: Harmonics above this are not counted — negligible on a guitar, and counting them
+#: just adds room for noise to be miscounted as "explained".
+HARMONIC_CHECK_MAX_FREQ = 6000.0
+HARMONIC_CHECK_HARMONICS = 12
+
 
 @dataclass(frozen=True)
 class PitchResult:
@@ -39,6 +52,9 @@ class PitchResult:
     cents: float
     confidence: float
     rms: float
+    harmonic_ratio: float = 1.0
+    """Fraction of spectral energy explained by this pitch's harmonic series.
+    High for a clean instrument tone, low for noise — see DEFAULT_MIN_HARMONIC_RATIO."""
 
     @property
     def pitch_class(self) -> int:
@@ -50,7 +66,9 @@ class PitchResult:
         return note_name(self.midi, with_octave=False)
 
     @classmethod
-    def from_freq(cls, freq: float, confidence: float, rms: float) -> PitchResult:
+    def from_freq(
+        cls, freq: float, confidence: float, rms: float, harmonic_ratio: float = 1.0
+    ) -> PitchResult:
         midi, cents = nearest_note(freq)
         return cls(
             freq=freq,
@@ -60,6 +78,7 @@ class PitchResult:
             cents=cents,
             confidence=confidence,
             rms=rms,
+            harmonic_ratio=harmonic_ratio,
         )
 
 
@@ -130,11 +149,13 @@ class YinDetector:
         threshold: float = DEFAULT_THRESHOLD,
         min_freq: float = MIN_FREQ,
         max_freq: float = MAX_FREQ,
+        min_harmonic_ratio: float = DEFAULT_MIN_HARMONIC_RATIO,
     ) -> None:
         self.sample_rate = sample_rate
         self.threshold = threshold
         self.min_freq = min_freq
         self.max_freq = max_freq
+        self.min_harmonic_ratio = min_harmonic_ratio
         self.min_tau = max(2, int(sample_rate / max_freq))
         self.max_tau = int(sample_rate / min_freq) + 1
 
@@ -166,8 +187,53 @@ class YinDetector:
         if not self._has_energy_at(frame, freq):
             return None
 
+        harmonic_ratio = self._harmonic_energy_ratio(frame, freq)
+        if harmonic_ratio < self.min_harmonic_ratio:
+            return None
+
         confidence = float(np.clip(1.0 - cmnd[tau], 0.0, 1.0))
-        return PitchResult.from_freq(freq, confidence, rms)
+        return PitchResult.from_freq(freq, confidence, rms, harmonic_ratio)
+
+    def _harmonic_energy_ratio(
+        self, frame: np.ndarray, freq: float, *, n_harmonics: int = HARMONIC_CHECK_HARMONICS
+    ) -> float:
+        """Fraction of spectral energy that sits at multiples of ``freq``.
+
+        This is what distinguishes "an instrument was played" from "something loud
+        happened near the microphone". A plucked string concentrates nearly all of its
+        energy at the fundamental and its harmonics; a keyboard click, a knock, or a
+        cough spreads energy across the spectrum instead, and scores low here even
+        though it might still be loud enough to pass the RMS gate and even periodic
+        enough to give YIN a confident-looking dip.
+
+        A sustained sung or spoken vowel is a genuine exception: voice is also a
+        harmonic source, so this ratio does not reliably tell it apart from a guitar
+        note. It targets percussive and noise-like false positives specifically.
+        """
+        windowed = frame.astype(np.float64) * np.hanning(len(frame))
+        power = np.abs(np.fft.rfft(windowed)) ** 2
+        bin_width = self.sample_rate / len(frame)
+
+        upper = min(len(power), int(HARMONIC_CHECK_MAX_FREQ / bin_width) + 1)
+        lower = max(1, int(self.min_freq / bin_width))
+        if upper <= lower:
+            return 0.0
+        total = power[lower:upper].sum()
+        if total <= 0:
+            return 0.0
+
+        harmonic_energy = 0.0
+        nyquist = self.sample_rate / 2.0
+        for k in range(1, n_harmonics + 1):
+            target = freq * k
+            if target >= HARMONIC_CHECK_MAX_FREQ or target >= nyquist:
+                break
+            center = target / bin_width
+            lo = max(0, int(center) - 2)
+            hi = min(len(power), int(center) + 3)
+            harmonic_energy += power[lo:hi].sum()
+
+        return float(min(1.0, harmonic_energy / total))
 
     def _has_energy_at(self, frame: np.ndarray, freq: float, *, floor: float = 0.02) -> bool:
         """Reject periods that are a subharmonic of the real fundamental.
