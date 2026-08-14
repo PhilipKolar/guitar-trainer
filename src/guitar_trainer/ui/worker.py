@@ -1,0 +1,152 @@
+"""The bridge between the audio thread and the GUI.
+
+Qt widgets may only be touched from the GUI thread, and DSP may not run on it without
+making the interface stutter. So analysis lives on its own thread and reports results
+through signals, which Qt delivers as queued calls on the GUI thread.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from PySide6.QtCore import QObject, QThread, Signal
+
+from ..audio.capture import DEFAULT_SAMPLE_RATE, AudioCapture
+from ..audio.chroma import ChromaAnalyser
+from ..audio.pitch import DEFAULT_HOP, DEFAULT_WINDOW, NoteGate, PitchResult, YinDetector
+
+
+class AnalysisWorker(QObject):
+    """Runs the detection loop on a worker thread."""
+
+    #: Every analysed frame, gated or not — drives the live readout and level meter.
+    frame_analysed = Signal(object)  # PitchResult | None
+    #: A note that has held steady long enough to be trusted.
+    note_stable = Signal(object)  # PitchResult
+    #: The stable note ended.
+    note_released = Signal()
+    #: Normalised chroma vector, for chord matching.
+    chroma_updated = Signal(object)  # np.ndarray
+    #: Input level, for the meter.
+    level_changed = Signal(float)
+    #: Something went wrong opening or reading the stream.
+    error = Signal(str)
+
+    def __init__(
+        self,
+        capture: AudioCapture,
+        *,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        window: int = DEFAULT_WINDOW,
+        hop: int = DEFAULT_HOP,
+    ) -> None:
+        super().__init__()
+        self.capture = capture
+        self.window = window
+        self.hop = hop
+        self.detector = YinDetector(sample_rate)
+        self.gate = NoteGate()
+        self.chroma = ChromaAnalyser(sample_rate)
+        self._running = False
+        self._suppress_until = 0.0
+        self._had_stable_note = False
+
+    # ------------------------------------------------------------- controls
+
+    def set_noise_gate(self, rms_threshold: float) -> None:
+        self.gate.rms_threshold = rms_threshold
+
+    def suppress_until(self, monotonic_time: float) -> None:
+        """Ignore input up to a point in time.
+
+        Used to blank out the metronome click so speaker bleed into the microphone
+        can't be scored as a played note.
+        """
+        self._suppress_until = max(self._suppress_until, monotonic_time)
+
+    def stop(self) -> None:
+        self._running = False
+
+    # ----------------------------------------------------------------- loop
+
+    def run(self) -> None:
+        """Entry point, connected to the thread's ``started`` signal."""
+        import time
+
+        self._running = True
+        try:
+            self.capture.start()
+        except Exception as exc:
+            self.error.emit(f"Could not open the audio input: {exc}")
+            return
+
+        interval = self.hop / self.detector.sample_rate
+        next_frame = time.monotonic()
+
+        try:
+            while self._running:
+                now = time.monotonic()
+                sleep_for = next_frame - now
+                if sleep_for > 0:
+                    QThread.usleep(int(sleep_for * 1_000_000))
+                next_frame += interval
+                if next_frame < time.monotonic() - interval:
+                    # Fell behind (a slow frame, or the machine was suspended); resync
+                    # rather than spinning through a backlog of stale windows.
+                    next_frame = time.monotonic() + interval
+
+                frame = self.capture.buffer.read_latest(self.window)
+                self._process(frame, time.monotonic())
+        finally:
+            self.capture.stop()
+
+    def _process(self, frame: np.ndarray, now: float) -> None:
+        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+        self.level_changed.emit(rms)
+
+        if now < self._suppress_until:
+            return
+
+        result: PitchResult | None = self.detector.detect(frame)
+        self.frame_analysed.emit(result)
+
+        stable = self.gate.push(result)
+        if stable is not None:
+            self._had_stable_note = True
+            self.note_stable.emit(stable)
+        elif self.gate.current is None and self._had_stable_note:
+            self._had_stable_note = False
+            self.note_released.emit()
+
+        chroma = self.chroma.analyse(frame)
+        if chroma is not None:
+            self.chroma_updated.emit(chroma)
+
+
+class AnalysisThread:
+    """Owns the worker and its thread, and shuts both down cleanly.
+
+    Qt requires the thread be stopped before the objects living on it are destroyed;
+    doing that in one place avoids the usual "QThread destroyed while still running"
+    crash on exit.
+    """
+
+    def __init__(self, capture: AudioCapture, **kwargs) -> None:
+        self.capture = capture
+        self.thread = QThread()
+        self.worker = AnalysisWorker(capture, **kwargs)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self, timeout_ms: int = 2000) -> None:
+        self.worker.stop()
+        self.thread.quit()
+        if not self.thread.wait(timeout_ms):
+            self.thread.terminate()
+            self.thread.wait()
+
+    @property
+    def is_running(self) -> bool:
+        return self.thread.isRunning()
