@@ -123,3 +123,17 @@ def strum(midi_notes, duration: float = 0.6, sr: int = SAMPLE_RATE, spread: floa
     if peak > 0:
         out = out / peak * 0.3
     return out.astype(np.float32)
+
+
+def load_wav(path):
+    """Load a 16-bit PCM WAV as float32 samples in roughly [-1, 1].
+
+    For the real recorded fixtures in tests/fixtures/audio/ — everything above this is
+    synthesised; this is the one loader for actual guitar audio.
+    """
+    from scipy.io import wavfile
+
+    sr, data = wavfile.read(str(path))
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    return sr, (data.astype(np.float32) / 32768.0)

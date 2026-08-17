@@ -69,6 +69,24 @@ purity one.
 All DSP tests run against synthesised signals, so the suite is deterministic and runs headless in
 CI.
 
+### Testing against your own guitar
+
+Synthesised signals validate the algorithm, but can't catch anything specific to one particular
+instrument, pickup, mic or player. `scripts/record_fixtures.py` records real single notes and
+checks them into `tests/fixtures/audio/`, so "detection feels erratic" becomes a concrete,
+re-runnable test instead of something to describe in words:
+
+```bash
+.venv/bin/python -m guitar_trainer.scripts.record_fixtures
+```
+
+Tune with a hardware tuner first. It walks through one chromatic octave on the low E string
+(open through the 11th fret), records a few seconds per note, and shows you what the detector
+made of each take before saving it, so a bad recording can be redone on the spot. Re-running
+`pytest` afterwards exercises every saved clip through the same detector + stability gate the
+app uses (`tests/test_real_recordings.py`) — if a change makes detection worse on your actual
+guitar, this is what catches it. Recording nothing is fine; those tests skip cleanly.
+
 ## How it works
 
 Audio is captured on PortAudio's realtime thread, which does nothing but copy samples into a ring

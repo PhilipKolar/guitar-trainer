@@ -83,9 +83,12 @@ src/guitar_trainer/
     stats_panel.py      history table
     worker.py           AnalysisWorker/AnalysisThread
     theme.py            colours + stylesheet
-  scripts/listen.py     terminal pitch-detection harness
+  scripts/
+    listen.py            terminal pitch-detection harness
+    record_fixtures.py   records real single notes into tests/fixtures/audio/notes/
 tests/
-  synth.py              signal synthesis helpers (NOT a test file)
+  synth.py               signal synthesis helpers (NOT a test file)
+  fixtures/audio/notes/  real recorded guitar audio, optional, see Testing below
   test_*.py
 ```
 
@@ -306,14 +309,28 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-746 tests, ~10 seconds, no audio hardware and no display required.
+762 tests (759 pass, 3 skip by default — see below), ~10 seconds, no audio hardware
+and no display required.
 
-**All DSP tests run against synthesised signals** (`tests/synth.py`), which is what
+**Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
 reproduces what actually breaks naive detectors — decaying harmonics, weak
 fundamentals, inharmonic partials, attack noise.
 
-- Prefer adding cases to `tests/synth.py`-driven tests over recording audio fixtures.
+**Real recorded fixtures are a deliberate, separate second layer, not a replacement
+for synthesised tests.** `tests/fixtures/audio/notes/*.wav` — one chromatic octave of
+real guitar notes on the author's actual instrument/mic, played via
+`scripts/record_fixtures.py` and checked by `tests/test_real_recordings.py`.
+Synthesised signals validate the *algorithm* against a model of reality; real
+recordings validate against reality itself, catching whatever's specific to one
+guitar/pickup/room/player that a model can't anticipate (this is exactly the class of
+bug behind "detection feels erratic" — vague reports that a synthetic test couldn't
+reproduce). The empty-fixtures case is a first-class, tested state (pytest's built-in
+empty-parametrize behaviour turns each into one "skipped" item, not zero items and not
+a failure) — recording is optional, never required to develop. If you add a new kind of
+DSP-affecting change, consider whether it's worth asking for a fresh recording pass
+rather than only adding synthetic cases; the synth model doesn't catch everything.
+
 - UI tests run under `QT_QPA_PLATFORM=offscreen` (set automatically in
   `tests/conftest.py`). `widget.grab()` forces a real `paintEvent` and is the cheapest
   way to catch painting crashes.
@@ -461,6 +478,13 @@ in response to real usage on the author's machine (very sensitive to speech/typi
 - Fixed inconsistent, low-contrast combo/spin-box arrows across the toolbar. See the
   Gotchas entry — `theme.STYLESHEET` is now `theme.stylesheet()`, a function (arrow
   icon generation needs a QApplication to exist first).
+- Added a real-recording test layer (`scripts/record_fixtures.py`,
+  `tests/test_real_recordings.py`) so "detection feels erratic" reports can become a
+  concrete, re-runnable test against the author's actual guitar instead of a verbal
+  description. See the Testing section above. **No recordings exist in the repo yet**
+  — the author hasn't run the recorder script. Once they do and commit the resulting
+  `tests/fixtures/audio/notes/*.wav`, treat detection regressions there with the same
+  weight as any other test failure.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
