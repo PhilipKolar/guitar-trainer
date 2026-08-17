@@ -49,7 +49,18 @@ def _level_bar(rms: float, width: int = 30) -> str:
     return "#" * filled + "." * (width - filled)
 
 
+#: How long to wait after Enter is pressed before the timed capture window starts.
+#: The keyboard's own acoustic tap — picked up by a sensitive mic sitting right next
+#: to it — otherwise ends up as the first ~0.3-0.4s of every clip (confirmed on real
+#: recordings: a clear amplitude spike right at the start, then a quiet gap before the
+#: actual note begins). Long enough for the tap to fully decay, short enough not to
+#: feel like a real pause.
+PRE_ROLL_SECONDS = 0.6
+
+
 def record_clip(capture: AudioCapture, duration: float, sample_rate: int) -> np.ndarray:
+    print(f"  (settling for {PRE_ROLL_SECONDS:.1f}s so the Enter key-tap isn't in the clip)")
+    time.sleep(PRE_ROLL_SECONDS)
     capture.buffer.clear()
     samples_needed = int(duration * sample_rate)
     start = time.monotonic()
@@ -118,7 +129,14 @@ def main() -> int:
         print(f"All {len(NOTE_PLAN)} notes already recorded in {args.out}. Use --force to redo them.")
         return 0
 
-    capture = AudioCapture(device=args.device, sample_rate=DEFAULT_SAMPLE_RATE)
+    # The ring buffer must hold at least one full clip — its default (~1.4s, sized for
+    # live detection, not recording) is far shorter than a multi-second take, and
+    # read_latest() raises rather than silently truncating.
+    capture = AudioCapture(
+        device=args.device,
+        sample_rate=DEFAULT_SAMPLE_RATE,
+        buffer_seconds=args.duration + 1.0,
+    )
     try:
         capture.start()
     except Exception as exc:

@@ -112,6 +112,94 @@ class TestRange:
         assert detector.detect(synth.sine(3000.0, duration=0.2)[:WINDOW]) is None
 
 
+class TestOctavePreference:
+    """`_prefer_lower_octave`: found by a real recorded fixture, not reasoned out on
+    paper. Scanning short-tau-first (needed to avoid octave-*down* errors) means a
+    strong upper partial right after a pick attack can be accepted as the first dip
+    before the true, lower fundamental's own — much better — dip is ever reached.
+    See AGENTS.md and tests/fixtures/audio/notes/E2.wav for the motivating case
+    (E2 briefly read as B3, its 3rd harmonic).
+
+    The first version of this fix (comparing CMND values alone, no spectral check)
+    caused a real regression — 0 to 43 synthetic test failures — because CMND's
+    running-mean normalisation can produce a deceptively low value at a large tau
+    with no genuine periodicity behind it at all. Every test here that expects *no*
+    switch is guarding against a version of that regression recurring.
+    """
+
+    def test_prefers_a_much_better_longer_period_candidate_with_real_energy(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        freq_true = midi_to_freq(name_to_midi("E2"))
+        frame = synth.sine(freq_true, duration=4096 / sr, sr=sr)[:4096].astype(np.float64)
+
+        cmnd = np.ones(700)
+        tau_first, tau_true = 194, 582  # true fundamental sits at ~3x the first dip
+        cmnd[tau_first] = 0.10  # crosses the default 0.12 threshold — picked first
+        cmnd[tau_true] = 0.03  # much better, and the frame genuinely contains it
+
+        assert detector._prefer_lower_octave(cmnd, tau_first, frame) == tau_true
+
+    def test_does_not_switch_without_real_spectral_support(self):
+        """The regression guard: a great-looking CMND value alone isn't enough."""
+        sr = 48000
+        detector = YinDetector(sr)
+        frame = np.zeros(4096)  # nothing in the spectrum anywhere
+
+        cmnd = np.ones(700)
+        cmnd[194] = 0.10
+        cmnd[582] = 0.03  # looks decisive on paper, but nothing backs it up
+
+        assert detector._prefer_lower_octave(cmnd, 194, frame) == 194
+
+    def test_does_not_switch_for_a_marginal_difference(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        freq = midi_to_freq(name_to_midi("E2"))
+        frame = synth.sine(freq, duration=4096 / sr, sr=sr)[:4096].astype(np.float64)
+
+        cmnd = np.ones(700)
+        cmnd[194] = 0.10
+        cmnd[582] = 0.09  # better, but not by OCTAVE_PREFERENCE_RATIO's margin
+
+        assert detector._prefer_lower_octave(cmnd, 194, frame) == 194
+
+    def test_candidate_must_also_clear_the_absolute_threshold(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        freq = midi_to_freq(name_to_midi("E2"))
+        frame = synth.sine(freq, duration=4096 / sr, sr=sr)[:4096].astype(np.float64)
+
+        cmnd = np.ones(700)
+        cmnd[194] = 0.20
+        cmnd[582] = 0.13  # comfortably ratio-better (0.13 < 0.20*0.75), but >= 0.12
+        assert detector.threshold == pytest.approx(0.12)
+
+        assert detector._prefer_lower_octave(cmnd, 194, frame) == 194
+
+    def test_picks_the_best_among_several_multiples(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        freq = midi_to_freq(name_to_midi("E2"))
+        frame = synth.sine(freq, duration=4096 / sr, sr=sr)[:4096].astype(np.float64)
+
+        cmnd = np.ones(700)
+        cmnd[97] = 0.10  # first dip (1x)
+        cmnd[194] = 0.08  # 2x: better, but not the best
+        cmnd[582] = 0.03  # 6x: the actual best fit, and matches the real frame
+
+        assert detector._prefer_lower_octave(cmnd, 97, frame) == 582
+
+    def test_stays_within_array_bounds_for_a_short_cmnd(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        frame = synth.sine(200.0, duration=4096 / sr, sr=sr)[:4096].astype(np.float64)
+        cmnd = np.ones(50)
+        cmnd[40] = 0.05
+        # Must not raise even though every multiple of 40 falls outside the array.
+        assert detector._prefer_lower_octave(cmnd, 40, frame) == 40
+
+
 class TestPurityFilter:
     """Rejecting noise that happens to be loud and periodic enough to fool YIN.
 

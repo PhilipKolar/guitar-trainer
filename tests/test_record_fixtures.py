@@ -6,17 +6,111 @@ around it: the note plan, the WAV round-trip, and the sanity-check scoring, sinc
 those are what would silently corrupt a recording session if broken.
 """
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
 import synth
+from guitar_trainer.audio.capture import AudioCapture
 from guitar_trainer.core.notes import STANDARD, midi_to_freq, name_to_midi, note_name
 from guitar_trainer.scripts.record_fixtures import (
     NOTE_PLAN,
     _level_bar,
+    record_clip,
     sanity_check,
     save_wav,
 )
+
+
+class TestRecordClipBufferSizing:
+    """Regression coverage for a real crash: AudioCapture's default ring buffer
+    (~1.4s, sized for live detection, not for recording a whole take) is far shorter
+    than a typical multi-second clip, and RingBuffer.read_latest() raises rather than
+    truncating when asked for more than it holds. main() must size the buffer to fit
+    --duration; these exercise that directly against the real AudioCapture/RingBuffer,
+    not a mock, so a future change that drops the sizing fails loudly here instead of
+    mid-recording-session.
+    """
+
+    def test_buffer_sized_for_duration_holds_a_full_clip(self):
+        duration, sample_rate = 4.0, 48000
+        capture = AudioCapture(sample_rate=sample_rate, buffer_seconds=duration + 1.0)
+        samples_needed = int(duration * sample_rate)
+        capture.buffer.write(np.zeros(samples_needed, dtype=np.float32))
+
+        # Must not raise — this is exactly what crashed with the default 1s buffer.
+        result = capture.buffer.read_latest(samples_needed)
+        assert len(result) == samples_needed
+
+    def test_default_buffer_is_too_small_for_a_multi_second_clip(self):
+        """Confirms the bug this is guarding against is real, not hypothetical —
+        the default buffer alone does raise for a normal recording duration."""
+        duration, sample_rate = 4.0, 48000
+        capture = AudioCapture(sample_rate=sample_rate)  # default buffer_seconds
+        with pytest.raises(ValueError):
+            capture.buffer.read_latest(int(duration * sample_rate))
+
+    def test_record_clip_does_not_crash_on_a_multi_second_duration(self, monkeypatch):
+        """record_clip() waits out PRE_ROLL_SECONDS and *then* clears the buffer, so
+        — unlike the other two tests here — the samples have to arrive after that,
+        from a separate thread, the way a real capture callback would deliver them."""
+        import guitar_trainer.scripts.record_fixtures as record_fixtures
+
+        monkeypatch.setattr(record_fixtures, "PRE_ROLL_SECONDS", 0.01)
+
+        duration, sample_rate = 4.0, 48000
+        capture = AudioCapture(sample_rate=sample_rate, buffer_seconds=duration + 1.0)
+        samples_needed = int(duration * sample_rate)
+
+        def feed_after_clear() -> None:
+            time.sleep(0.05)
+            capture.buffer.write(np.zeros(samples_needed, dtype=np.float32))
+
+        threading.Thread(target=feed_after_clear, daemon=True).start()
+        result = record_clip(capture, duration, sample_rate)
+        assert len(result) == samples_needed
+
+
+class TestPreRoll:
+    """Regression coverage for a real contamination bug: the acoustic tap of the
+    Enter keypress that starts recording — picked up by a mic sitting right next to
+    the keyboard — was ending up as the first ~0.3-0.4s of every clip (confirmed via
+    a clear amplitude spike at t=0 in real recordings, followed by a quiet gap before
+    the actual note began). record_clip() now waits out the tap before the timed
+    window starts.
+    """
+
+    def test_pre_tap_audio_is_discarded_not_recorded(self, monkeypatch):
+        import guitar_trainer.scripts.record_fixtures as record_fixtures
+
+        monkeypatch.setattr(record_fixtures, "PRE_ROLL_SECONDS", 0.05)
+
+        duration, sample_rate = 0.2, 48000
+        capture = AudioCapture(sample_rate=sample_rate, buffer_seconds=duration + 1.0)
+        # A loud "tap" already sitting in the buffer before record_clip() is even
+        # called — simulates the keyboard-tap transient a mic would have already
+        # picked up by the time Enter is pressed.
+        capture.buffer.write(np.full(1000, 0.9, dtype=np.float32))
+
+        def feed() -> None:
+            time.sleep(0.1)  # after the (shortened) pre-roll
+            capture.buffer.write(np.zeros(int(duration * sample_rate), dtype=np.float32))
+
+        threading.Thread(target=feed, daemon=True).start()
+        result = record_clip(capture, duration, sample_rate)
+
+        # The loud pre-roll tap must not appear anywhere in the recorded clip.
+        assert not np.any(result > 0.5)
+
+    def test_default_is_long_enough_for_a_key_tap_to_decay(self):
+        import guitar_trainer.scripts.record_fixtures as record_fixtures
+
+        # Not a precise acoustic claim — just a sanity floor. Too short and this
+        # regresses back to capturing the tap; the exact value was picked from what a
+        # real recording showed (spike gone by ~0.4s).
+        assert record_fixtures.PRE_ROLL_SECONDS >= 0.4
 
 
 class TestNotePlan:

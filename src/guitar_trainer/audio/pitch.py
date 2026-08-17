@@ -27,6 +27,17 @@ DEFAULT_HOP = 1024
 #: Below this, YIN's normalised difference indicates a periodic signal.
 DEFAULT_THRESHOLD = 0.12
 
+#: A longer-period (lower-frequency) candidate is preferred over the one first picked
+#: only if its CMND value is at least this much better — see _prefer_lower_octave.
+#: Tuned against real recordings (tests/fixtures/audio/notes/): genuine fundamentals
+#: won by margins of ~3-10x there, while a near-tie late in a note's decay (where the
+#: true fundamental had genuinely faded, not just been mis-picked) sat around 0.9x.
+#: 0.75 catches the former without forcing the latter.
+OCTAVE_PREFERENCE_RATIO = 0.75
+#: How many integer multiples of the picked tau to check for a better-fitting
+#: fundamental. 6 matches the harmonic count used elsewhere (chroma, chord templates).
+OCTAVE_SEARCH_MULTIPLES = 6
+
 #: How much of a frame's spectral energy must sit at multiples of the detected
 #: fundamental for it to count as an instrument tone. A clean plucked string
 #: concentrates almost all its energy there (ratio > 0.98 across the neck, even at
@@ -172,7 +183,7 @@ class YinDetector:
         diff = _difference_function(frame, max_tau)
         cmnd = _cumulative_mean_normalised(diff)
 
-        tau = self._pick_tau(cmnd)
+        tau = self._pick_tau(cmnd, frame)
         if tau is None:
             return None
 
@@ -263,12 +274,21 @@ class YinDetector:
         hi = min(len(magnitude), target + 3)
         return bool(magnitude[lo:hi].max() >= floor * peak)
 
-    def _pick_tau(self, cmnd: np.ndarray) -> int | None:
-        """First dip below the threshold, descended to its local minimum.
+    def _pick_tau(self, cmnd: np.ndarray, frame: np.ndarray) -> int | None:
+        """First dip below the threshold, descended to its local minimum, then
+        checked against longer-period multiples in case one of them is actually the
+        true fundamental.
 
-        Taking the *first* qualifying dip rather than the global minimum is what avoids
-        octave-down errors; walking to the bottom of that dip avoids landing on its
-        leading edge.
+        Taking the *first* qualifying dip rather than the global minimum is what
+        avoids octave-down errors (locking onto a subharmonic); walking to the bottom
+        of that dip avoids landing on its leading edge. But scanning short-tau-first
+        has the opposite failure mode too: right after a pick attack, a strong upper
+        partial can genuinely look more periodic within one short analysis window
+        than the true, lower fundamental, and get accepted as the first dip before
+        the fundamental's own (better) dip is ever reached. `_prefer_lower_octave`
+        catches that — real recordings, not just theory, showed a fundamental's CMND
+        several times lower than the harmonic's at the exact frame this happened
+        (tests/fixtures/audio/notes/, see AGENTS.md).
         """
         search = cmnd[self.min_tau :]
         below = np.flatnonzero(search < self.threshold)
@@ -278,12 +298,68 @@ class YinDetector:
             # Descend to the bottom of this dip.
             while tau + 1 < len(cmnd) and cmnd[tau + 1] < cmnd[tau]:
                 tau += 1
-            return tau
+            return self._prefer_lower_octave(cmnd, tau, frame)
 
         # Nothing crossed the threshold. Fall back to the global minimum, which lets
         # borderline-noisy signals still register, gated by the confidence value.
         tau = int(np.argmin(search)) + self.min_tau
         return tau if cmnd[tau] < 0.6 else None
+
+    def _prefer_lower_octave(
+        self,
+        cmnd: np.ndarray,
+        tau: int,
+        frame: np.ndarray,
+        *,
+        max_multiple: int = OCTAVE_SEARCH_MULTIPLES,
+    ) -> int:
+        """Check integer multiples of ``tau`` (longer periods = lower frequencies)
+        for a noticeably better-fitting fundamental than the one just picked.
+
+        A genuine fundamental that's actually present wins this comparison by a wide
+        margin (3-10x lower CMND in the recordings that motivated this); noise-level
+        differences between nearby candidates don't clear `OCTAVE_PREFERENCE_RATIO`,
+        so this doesn't destabilise an already-correct pick.
+
+        Two guards, both found by letting this run against real recordings and the
+        full synthetic suite rather than reasoning it through on paper alone:
+
+        - The candidate must clear the absolute periodicity threshold on its own,
+          not just be relatively better than the original — in a quiet decay tail
+          where neither candidate is a clean periodic signal, "relatively less bad"
+          can win out over noise.
+        - The candidate must have genuine spectral energy at its own frequency
+          (`_has_energy_at`), not just a low CMND value. CMND's normalisation (it
+          divides by a *running mean* that grows with tau) can produce deceptively
+          low values at large tau with no real periodicity behind them at all —
+          without this check, the search would occasionally "win" with a spurious
+          low-frequency candidate that then fails every check downstream in
+          `detect()`, turning a correct detection into no detection whatsoever
+          (worse than doing nothing). This is what the first version of this method
+          did, caught by the synthetic suite going from 0 to 43 failures.
+        """
+        best_tau, best_value = tau, cmnd[tau]
+        for k in range(2, max_multiple + 1):
+            candidate = tau * k
+            if candidate >= len(cmnd) - 1:
+                break
+            # The true dip may sit a sample or two either side of the exact multiple.
+            c = candidate
+            while c + 1 < len(cmnd) and cmnd[c + 1] < cmnd[c]:
+                c += 1
+            while c - 1 > 0 and cmnd[c - 1] < cmnd[c]:
+                c -= 1
+            if cmnd[c] >= self.threshold or cmnd[c] >= best_value * OCTAVE_PREFERENCE_RATIO:
+                continue
+            refined = _parabolic_refine(cmnd, c)
+            if refined <= 0:
+                continue
+            candidate_freq = self.sample_rate / refined
+            if not self.min_freq <= candidate_freq <= self.max_freq:
+                continue
+            if self._has_energy_at(frame, candidate_freq):
+                best_tau, best_value = c, cmnd[c]
+        return best_tau
 
 
 class NoteGate:

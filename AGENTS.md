@@ -196,6 +196,42 @@ a genuine, useful "mixed" set (e.g. C#, Eb, F#, G#, Bb rather than all-sharp or
 all-flat) and lands within the "practice on real hardware" grain of testability the
 rest of the codebase already leans on.
 
+**YIN's tau selection now checks longer-period multiples for a genuinely better fit,
+not just the first dip below threshold — but only with real spectral evidence behind
+it.** `YinDetector._pick_tau` scans short-tau-first (small tau = high frequency) and
+stops at the first dip below `threshold`; that's deliberate, since it's what avoids
+octave-*down* errors (locking onto a subharmonic ghost). But it has the opposite
+failure mode too: right after a pick attack, a strong upper partial can look more
+periodic within one short analysis window than the true, lower fundamental, and get
+accepted before the fundamental's own — much better — dip is ever reached. A real
+recording caught this directly: E2 briefly read as B3 (its 3rd harmonic) with CMND
+0.030 at E2's own tau vs 0.102 at B3's, a 3x gap that had nothing to do with signal
+quality, just scan order.
+
+`_prefer_lower_octave` checks integer multiples of the picked tau (2x, 3x, ... up to
+`OCTAVE_SEARCH_MULTIPLES`) and switches to one only if it clears *three* separate
+bars: (1) the absolute periodicity threshold on its own — not just relatively better
+than the original, which matters in a quiet decay tail where neither candidate is
+genuinely periodic and "less bad" isn't meaningful; (2) `OCTAVE_PREFERENCE_RATIO`
+(0.75) better than the current best, so noise-level differences can't flip a correct
+pick; (3) **real spectral energy at its own frequency** (`_has_energy_at`), not just a
+low CMND number. That third check exists because the first version of this fix didn't
+have it and caused a real regression — 0 to 43 synthetic test failures — because
+CMND's normalisation (it divides by a *running mean* that grows with tau) can produce
+a deceptively low value at a large tau with no genuine periodicity behind it at all.
+Without the spectral check, the search would occasionally "win" with a spurious
+candidate that then failed every downstream check in `detect()`, turning a *correct*
+detection into *no* detection — worse than not searching at all. If you touch this
+again: run the full synthetic suite AND the real recordings before trusting a change,
+in that order — the synthetic suite catches "broke something," the real recordings
+catch "didn't actually fix the thing."
+
+This does **not** fix every octave/pitch-class confusion found in the recorded
+fixtures — three remain as of this writing (C#3, D#3, D3 — see Status below),
+diagnosed as a different, harder problem: cases where the *wrong* candidate's CMND is
+genuinely comparable to or better than the correct one at the failing frame, not just
+reached first. That needs a different approach, not a bigger version of this fix.
+
 **Rhythm mode scores a correct answer immediately but doesn't advance until the beat
 window elapses.** `SessionEngine.advance_on_correct=False` (set for rhythm mode only,
 in `PracticePanel.start_session`) is what this controls. Originally a correct answer
@@ -302,6 +338,9 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `UNEXPLAINED_PENALTY` | 0.55 (works 0.4–0.7) | `core/chords.py` | `test_chords.py` |
 | `HARMONIC_DECAY` / `N_HARMONICS` | 0.6 / 6 | `core/chords.py` | `test_chords.py` |
 | `DEFAULT_MIN_HARMONIC_RATIO` | 0.6 (guitar floor ~0.98, click ceiling ~0.51) | `audio/pitch.py` | `test_pitch.py::TestPurityFilter` |
+| `OCTAVE_PREFERENCE_RATIO` | 0.75 (real wins were 0.29-0.69, a late-decay near-tie was 0.91) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference`, `test_real_recordings.py` |
+| `OCTAVE_SEARCH_MULTIPLES` | 6 (matches the harmonic count used elsewhere: chroma, chord templates) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference` |
+| `PRE_ROLL_SECONDS` (recorder) | 0.6 (tap transient measurably gone by ~0.4s in a real recording) | `scripts/record_fixtures.py` | `test_record_fixtures.py::TestPreRoll` |
 | `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
 | `METER_HOLD_MS` | 700 | `ui/modes.py` | `test_ui.py` (Tuner/FreeDetect hold tests) |
 | debounced save delay | 400ms | `ui/main_window.py` `_mark_dirty` | `test_ui.py::TestSettingsPersistence` |
@@ -309,8 +348,9 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-762 tests (759 pass, 3 skip by default — see below), ~10 seconds, no audio hardware
-and no display required.
+795 tests (792 pass, 3 currently fail against real recordings — see Status below, this
+is the system surfacing real, not-yet-fixed detection bugs, not a broken test), ~11
+seconds, no audio hardware and no display required for the rest of the suite.
 
 **Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -325,11 +365,25 @@ Synthesised signals validate the *algorithm* against a model of reality; real
 recordings validate against reality itself, catching whatever's specific to one
 guitar/pickup/room/player that a model can't anticipate (this is exactly the class of
 bug behind "detection feels erratic" — vague reports that a synthetic test couldn't
-reproduce). The empty-fixtures case is a first-class, tested state (pytest's built-in
-empty-parametrize behaviour turns each into one "skipped" item, not zero items and not
-a failure) — recording is optional, never required to develop. If you add a new kind of
-DSP-affecting change, consider whether it's worth asking for a fresh recording pass
-rather than only adding synthetic cases; the synth model doesn't catch everything.
+reproduce). The empty-fixtures case is still a first-class, tested state (pytest's
+built-in empty-parametrize behaviour turns each into one "skipped" item, not zero items
+and not a failure) — recording is optional, never required to develop, even though a
+full 12-note set now exists (see Status below). If you add a new kind of DSP-affecting
+change, consider whether it's worth asking for a fresh recording pass rather than only
+adding synthetic cases; the synth model doesn't catch everything — it's what caught the
+first real detection bug here (E2 briefly misread as B3) that 168 synthetic tests never
+found, because the failure mode needed the actual harmonic complexity of a real plucked
+string, not an idealised model of one.
+
+**When a real recording's test fails, diagnose from the CMND curve before touching
+code.** Don't guess at a fix from the symptom alone. The pattern that worked: dump
+`_difference_function` + `_cumulative_mean_normalised` for the exact failing frame
+(`start = int(t * sr)`, find `t` from `_stable_readings`'s per-frame scan), compare the
+CMND value at the expected note's tau against the wrong note's tau. That distinguishes
+real, fixable bugs (expected note's CMND is *far* better, just never reached — see the
+octave-preference decision below) from harder ambiguities (the wrong note's CMND is
+genuinely comparable or better, meaning the signal itself is ambiguous at that moment,
+usually in a quiet decay tail near the noise floor) before writing any code.
 
 - UI tests run under `QT_QPA_PLATFORM=offscreen` (set automatically in
   `tests/conftest.py`). `widget.grab()` forces a real `paintEvent` and is the cheapest
@@ -481,10 +535,29 @@ in response to real usage on the author's machine (very sensitive to speech/typi
 - Added a real-recording test layer (`scripts/record_fixtures.py`,
   `tests/test_real_recordings.py`) so "detection feels erratic" reports can become a
   concrete, re-runnable test against the author's actual guitar instead of a verbal
-  description. See the Testing section above. **No recordings exist in the repo yet**
-  — the author hasn't run the recorder script. Once they do and commit the resulting
-  `tests/fixtures/audio/notes/*.wav`, treat detection regressions there with the same
-  weight as any other test failure.
+  description. See the Testing section above.
+- Fixed a real recording-script bug: `record_clip()` requested a full multi-second
+  clip from `AudioCapture`'s ring buffer, which defaults to holding only ~1.4s (sized
+  for live detection, not for recording a whole take) — `read_latest()` raised rather
+  than truncating, crashing the recorder mid-session. Now sizes the buffer to
+  `duration + 1.0` seconds. Guarded by `test_record_fixtures.py::TestRecordClipBufferSizing`.
+- Fixed the recorder capturing the acoustic tap of the Enter keypress (a sensitive mic
+  sitting right next to the keyboard) as the first ~0.3-0.4s of every clip — confirmed
+  via a clear amplitude spike at t=0 in real recordings. `PRE_ROLL_SECONDS` (0.6s)
+  delay before the buffer is cleared and the timed window starts. See
+  `test_record_fixtures.py::TestPreRoll`.
+- **The first full 12-note recording session happened** (`tests/fixtures/audio/notes/`
+  — one chromatic octave, low E string open through fret 11). The first 0.6s of each
+  original recording was contaminated by the keyboard tap above; all 12 were trimmed
+  in place once the bug was understood, rather than asking for a re-record.
+- This immediately found real bugs no synthetic test had: see the octave-preference
+  design decision above (E2/A#2 fixed) and the diagnosis note ahead of it (C#3, D#3,
+  D3 — **still failing, not yet fixed**, a different and harder problem: the wrong
+  candidate's CMND is genuinely comparable to or better than the correct one at the
+  failing frame, not just reached first by scan order). Running `pytest` right now
+  shows 3 real failures in `test_real_recordings.py` — that's the harness doing
+  exactly what it was built for, not something to silence. Whoever picks this up next:
+  start from the CMND-diagnosis note in the Testing section above.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
