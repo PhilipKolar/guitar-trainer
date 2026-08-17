@@ -226,11 +226,48 @@ again: run the full synthetic suite AND the real recordings before trusting a ch
 in that order — the synthetic suite catches "broke something," the real recordings
 catch "didn't actually fix the thing."
 
-This does **not** fix every octave/pitch-class confusion found in the recorded
-fixtures — three remain as of this writing (C#3, D#3, D3 — see Status below),
-diagnosed as a different, harder problem: cases where the *wrong* candidate's CMND is
-genuinely comparable to or better than the correct one at the failing frame, not just
-reached first. That needs a different approach, not a bigger version of this fix.
+**The fallback path (nothing crosses the absolute CMND threshold) also needed a
+guard, for a different reason.** It picks the plain global minimum across the whole
+search range, gated only by a loose `cmnd < 0.6` confidence check. C#3 showed this
+trusting a "minimum" that sat at the literal last index of the valid tau range,
+where CMND was still monotonically *decreasing* — not a genuine dip, just where the
+search ran out. CMND's running-mean normalisation drifts downward toward large tau
+independent of real periodicity (the same underlying mechanism behind the spectral
+check above), and near the search boundary there's no "far side" of a dip left to
+disprove it. `FALLBACK_EDGE_MARGIN` (5) rejects any fallback candidate within that
+many samples of the array's true end (`len(cmnd) - 1`, not the `min_tau`-offset
+search slice's end — get this wrong and the check silently never fires, since
+`min_tau > 0` always). Diagnosis method: dump the CMND values in a small window
+around the picked tau; a genuine dip curves back up on both sides, this one didn't
+turn around at all before the array ended.
+
+**Two failures remain and are diagnosed but deliberately not force-fixed** (D#3, D3
+— see Status below), because in both cases the honest evidence says there isn't a
+safe, general fix available right now, not just that one hasn't been found yet:
+
+- **D3 → D2**: real, substantial spectral energy at D2's own frequency (73.4Hz) — not
+  algorithmic noise, an actual peak in the FFT, present in this frame and, at lower
+  levels, in the quiet portions of *other* recordings too (likely persistent room/mic
+  low-frequency rumble). The tempting fix — raise `MIN_FREQ` above this band — was
+  checked and rejected: **Drop D and Half-step-down tunings intentionally support
+  notes in exactly this range** (Drop D's low string is D2 itself). Raising the floor
+  to patch one recording's noise would silently break a real, supported feature.
+- **D#3 → E3**: a genuine attack-transient pitch ambiguity — the raw per-frame
+  estimate bounces between D#3 and E3 for the first ~60ms after the pluck, before the
+  waveform settles and locks onto D#3 correctly and stays there. Tried the obvious
+  lever (raising `NoteGate.stable_frames` from 3 so a brief wrong streak can't pass
+  the stability gate) and measured it against every recorded fixture before
+  committing to anything: it doesn't cleanly fix this (D#3 only fully resolves at
+  `stable_frames=5`, not 4) and barely dents D3 (36 → 26 wrong readings, still
+  substantial) — while adding real latency to *every* note detection across the whole
+  app for an unclear, partial win. Rejected on that basis, not shipped.
+
+Whoever picks these up next: the CMND-diagnosis method above is the right starting
+point for D3 (is the energy at 73Hz consistent across many fresh recordings, or was
+this one take unusually noisy?); D#3 likely needs actual onset detection — suppressing
+scoring during the first N ms after a volume rise — rather than another tau-picking
+heuristic, since the raw estimate here isn't wrong due to how tau was chosen, it's
+wrong because the waveform itself hadn't settled yet.
 
 **Rhythm mode scores a correct answer immediately but doesn't advance until the beat
 window elapses.** `SessionEngine.advance_on_correct=False` (set for rhythm mode only,
@@ -340,6 +377,7 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `DEFAULT_MIN_HARMONIC_RATIO` | 0.6 (guitar floor ~0.98, click ceiling ~0.51) | `audio/pitch.py` | `test_pitch.py::TestPurityFilter` |
 | `OCTAVE_PREFERENCE_RATIO` | 0.75 (real wins were 0.29-0.69, a late-decay near-tie was 0.91) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference`, `test_real_recordings.py` |
 | `OCTAVE_SEARCH_MULTIPLES` | 6 (matches the harmonic count used elsewhere: chroma, chord templates) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference` |
+| `FALLBACK_EDGE_MARGIN` | 5 samples from the true array end | `audio/pitch.py` | `test_pitch.py::TestFallbackEdgeRejection` |
 | `PRE_ROLL_SECONDS` (recorder) | 0.6 (tap transient measurably gone by ~0.4s in a real recording) | `scripts/record_fixtures.py` | `test_record_fixtures.py::TestPreRoll` |
 | `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
 | `METER_HOLD_MS` | 700 | `ui/modes.py` | `test_ui.py` (Tuner/FreeDetect hold tests) |
@@ -348,8 +386,8 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-795 tests (792 pass, 3 currently fail against real recordings — see Status below, this
-is the system surfacing real, not-yet-fixed detection bugs, not a broken test), ~11
+799 tests (796 pass, 2 currently fail against real recordings — see Status below, this
+is the system surfacing real, not-yet-fixed detection bugs, not a broken test), ~12
 seconds, no audio hardware and no display required for the rest of the suite.
 
 **Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
@@ -550,14 +588,18 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   — one chromatic octave, low E string open through fret 11). The first 0.6s of each
   original recording was contaminated by the keyboard tap above; all 12 were trimmed
   in place once the bug was understood, rather than asking for a re-record.
-- This immediately found real bugs no synthetic test had: see the octave-preference
-  design decision above (E2/A#2 fixed) and the diagnosis note ahead of it (C#3, D#3,
-  D3 — **still failing, not yet fixed**, a different and harder problem: the wrong
-  candidate's CMND is genuinely comparable to or better than the correct one at the
-  failing frame, not just reached first by scan order). Running `pytest` right now
-  shows 3 real failures in `test_real_recordings.py` — that's the harness doing
-  exactly what it was built for, not something to silence. Whoever picks this up next:
-  start from the CMND-diagnosis note in the Testing section above.
+- This immediately found real bugs no synthetic test had: E2, A#2 and C#3 are now
+  fixed (see the octave-preference and fallback-edge-rejection design decisions
+  above). **D#3 and D3 are still failing, not yet fixed** — both diagnosed in detail
+  (see the design decision above) and found to need either more evidence (D3: is the
+  ~73Hz energy consistent across fresh recordings, or was this one take unusually
+  noisy?) or a different kind of fix entirely (D#3: real onset detection, not another
+  tau-picking heuristic) rather than a rushed patch. A global lever that was tried and
+  measured against every fixture before being rejected: raising `NoteGate.stable_frames`
+  neither cleanly fixes either case nor comes for free (real added latency on every
+  detection app-wide) — see the design decision for the actual numbers. Running
+  `pytest` right now shows 2 real failures in `test_real_recordings.py` — that's the
+  harness doing exactly what it was built for, not something to silence.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:

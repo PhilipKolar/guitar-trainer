@@ -112,6 +112,51 @@ class TestRange:
         assert detector.detect(synth.sine(3000.0, duration=0.2)[:WINDOW]) is None
 
 
+class TestFallbackEdgeRejection:
+    """The fallback path (nothing crosses the absolute CMND threshold) used to trust
+    a plain global-minimum search unconditionally. A real recording caught this: the
+    "minimum" sat at the literal last index of the valid tau range, where CMND was
+    still monotonically decreasing — not a genuine dip, just where the search ran out
+    (CMND's running-mean normalisation drifts downward toward large tau independent of
+    real periodicity). That produced a confident, wrong, octave-off reading. See
+    AGENTS.md and tests/fixtures/audio/notes/C#3.wav.
+    """
+
+    def test_rejects_a_candidate_at_the_very_edge_of_the_search_range(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        cmnd = np.linspace(1.0, 0.2, detector.max_tau)  # monotonic, no genuine dip
+        frame = np.zeros(4096, dtype=np.float64)
+
+        assert detector._pick_tau(cmnd, frame) is None
+
+    def test_still_accepts_a_genuine_dip_away_from_the_edge(self):
+        sr = 48000
+        detector = YinDetector(sr)
+        freq = midi_to_freq(name_to_midi("A2"))
+        frame = synth.sine(freq, duration=4096 / sr, sr=sr)[:4096].astype(np.float64)
+
+        cmnd = np.ones(detector.max_tau)
+        tau = int(round(sr / freq))
+        cmnd[tau - 2 : tau + 3] = [0.5, 0.3, 0.2, 0.3, 0.5]  # a real, bowl-shaped dip
+        assert cmnd[tau] < 0.6  # still clears the fallback's own confidence gate
+
+        assert detector._pick_tau(cmnd, frame) == tau
+
+    def test_margin_is_measured_from_the_true_array_end_not_the_search_slice(self):
+        """min_tau offsets the search slice from cmnd; the edge check must account
+        for that offset rather than treating the slice as if it started at 0."""
+        sr = 48000
+        detector = YinDetector(sr)
+        frame = np.zeros(4096, dtype=np.float64)
+        cmnd = np.linspace(1.0, 0.2, detector.max_tau)
+        # The true edge of `search = cmnd[min_tau:]` is len(cmnd) - 1, not
+        # len(search) - 1 -- if the check used the wrong length it would never
+        # reject anything, since min_tau > 0 always.
+        assert detector.min_tau > 0
+        assert detector._pick_tau(cmnd, frame) is None
+
+
 class TestOctavePreference:
     """`_prefer_lower_octave`: found by a real recorded fixture, not reasoned out on
     paper. Scanning short-tau-first (needed to avoid octave-*down* errors) means a

@@ -38,6 +38,13 @@ OCTAVE_PREFERENCE_RATIO = 0.75
 #: fundamental. 6 matches the harmonic count used elsewhere (chroma, chord templates).
 OCTAVE_SEARCH_MULTIPLES = 6
 
+#: The fallback path's global-minimum search must not trust a candidate sitting this
+#: close to the edge of the valid tau range — CMND's normalisation drifts downward
+#: toward large tau independent of real periodicity, so a "minimum" found only because
+#: the search ran out isn't a genuine dip. Tuned against a real recording where this
+#: produced a confident, wrong, octave-off reading (see _pick_tau).
+FALLBACK_EDGE_MARGIN = 5
+
 #: How much of a frame's spectral energy must sit at multiples of the detected
 #: fundamental for it to count as an instrument tone. A clean plucked string
 #: concentrates almost all its energy there (ratio > 0.98 across the neck, even at
@@ -303,6 +310,18 @@ class YinDetector:
         # Nothing crossed the threshold. Fall back to the global minimum, which lets
         # borderline-noisy signals still register, gated by the confidence value.
         tau = int(np.argmin(search)) + self.min_tau
+        if tau >= len(cmnd) - FALLBACK_EDGE_MARGIN:
+            # CMND's normalisation (dividing by a running mean that grows with tau)
+            # makes it drift generally downward toward large tau independent of any
+            # real periodicity — a genuine dip curves back up on both sides, but this
+            # is just wherever the search range happened to run out while still
+            # descending. A real recording landed exactly here (a quiet, ambiguous
+            # frame confidently "detected" as a note an octave below what was played,
+            # sitting right at this boundary, monotonically decreasing with no dip
+            # shape at all — see AGENTS.md). The valid range already extends below
+            # the guitar's lowest note (MIN_FREQ=70Hz vs open low E at 82.4Hz), so a
+            # genuine low note never needs to sit at this edge.
+            return None
         return tau if cmnd[tau] < 0.6 else None
 
     def _prefer_lower_octave(
