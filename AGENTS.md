@@ -241,33 +241,56 @@ search slice's end — get this wrong and the check silently never fires, since
 around the picked tau; a genuine dip curves back up on both sides, this one didn't
 turn around at all before the array ended.
 
-**Two failures remain and are diagnosed but deliberately not force-fixed** (D#3, D3
-— see Status below), because in both cases the honest evidence says there isn't a
-safe, general fix available right now, not just that one hasn't been found yet:
+**The last two real-recording failures (D3 → D2, D#3 → E3) were fixed in `NoteGate`,
+not the detector — with physics rules, not more tau-picking heuristics.** Both were
+first mis-diagnosed as detector problems; frame-by-frame inspection of the recordings
+showed the detector's raw readings were *honest reports of real signal content*, and
+what was missing was judgement about which reports constitute a played note:
 
-- **D3 → D2**: real, substantial spectral energy at D2's own frequency (73.4Hz) — not
-  algorithmic noise, an actual peak in the FFT, present in this frame and, at lower
-  levels, in the quiet portions of *other* recordings too (likely persistent room/mic
-  low-frequency rumble). The tempting fix — raise `MIN_FREQ` above this band — was
-  checked and rejected: **Drop D and Half-step-down tunings intentionally support
-  notes in exactly this range** (Drop D's low string is D2 itself). Raising the floor
-  to patch one recording's noise would silently break a real, supported feature.
-- **D#3 → E3**: a genuine attack-transient pitch ambiguity — the raw per-frame
-  estimate bounces between D#3 and E3 for the first ~60ms after the pluck, before the
-  waveform settles and locks onto D#3 correctly and stays there. Tried the obvious
-  lever (raising `NoteGate.stable_frames` from 3 so a brief wrong streak can't pass
-  the stability gate) and measured it against every recorded fixture before
-  committing to anything: it doesn't cleanly fix this (D#3 only fully resolves at
-  `stable_frames=5`, not 4) and barely dents D3 (36 → 26 wrong readings, still
-  substantial) — while adding real latency to *every* note detection across the whole
-  app for an unclear, partial win. Rejected on that basis, not shipped.
+- **D3 → D2** (was: a full second of confident, wrong D2 stables during D3's decay).
+  The ~73Hz energy is genuinely produced by the guitar — an initial "room/mic rumble"
+  theory was ruled out (quiet room), and by late decay the ~72Hz component is
+  literally the loudest peak in the spectrum, drifting between 71–74Hz (also the
+  source of stray `C#2+49c` readings — it isn't harmonically locked to the string).
+  No spectral threshold separates it from a real low note; what *does* separate it is
+  time: the whole false-D2 region sits inside a monotonic RMS decay. **You cannot
+  physically sound a new, lower note without putting new energy into a string.** So
+  the gate now suppresses a stable-note switch to a subharmonic of the held note
+  (freq ratio within `SUBHARMONIC_TOLERANCE_CENTS` of an integer ≥ 2) unless some
+  frame in the new window is `ONSET_RMS_FACTOR` (1.5x) louder than the quietest frame
+  heard since the held note confirmed. A genuine re-plucked Drop-D-style low note
+  clears that bar easily even after a long decay (a re-pluck is >2x the decay floor);
+  the false region never does (~1.0x). Two subtleties both found by running the rule
+  against the recordings, not on paper: the held-note memory must **survive
+  agreement churn and brief confidence dips** (two low-confidence frames mid-decay
+  otherwise wipe it and the false D2 confirms fresh — hence `_last_note` being
+  separate from `_current`, forgotten only after `SILENT_FRAMES_TO_FORGET`
+  consecutive closed frames ≈ 300ms), and the decay floor must be tracked across
+  *rejected* frames too, since that's where the quietest moments live.
+- **D#3 → E3** (was: three stable "E3" readings right after the pluck). Not
+  bouncing between notes at all — the recording shows ~100ms parked at ~160.3Hz,
+  a quarter-tone between D#3 (155.6) and E3 (164.8), reading `E3-46c`..`E3-49c`.
+  A hard pluck momentarily raises string tension, so the attack genuinely rings
+  sharp before gliding down onto the note. Those frames agree with *each other* to
+  within a few cents, so the inter-frame tolerance check confirmed them happily.
+  The gate now also requires the stable window's median to sit within
+  `CENTER_TOLERANCE_CENTS` (±40) of its nearest note's center — a self-consistent
+  pitch parked *between* two notes is "still moving", not a note event. Across all
+  12 fixtures, readings belonging to the played note stay inside ±40c (worst: 39c);
+  everything beyond was an artifact (+43..47c attack overshoot, the ±46–49c false
+  readings above). This rule alone also killed D3's stray C#2 tail.
 
-Whoever picks these up next: the CMND-diagnosis method above is the right starting
-point for D3 (is the energy at 73Hz consistent across many fresh recordings, or was
-this one take unusually noisy?); D#3 likely needs actual onset detection — suppressing
-scoring during the first N ms after a volume rise — rather than another tau-picking
-heuristic, since the raw estimate here isn't wrong due to how tau was chosen, it's
-wrong because the waveform itself hadn't settled yet.
+Neither rule adds latency for in-tune playing, and both were validated the standard
+way: prototyped against all 12 real recordings first (12/12 pass; the only correct
+readings lost anywhere are 4 attack frames at +43..47c across two clips), then the
+full synthetic suite. The earlier rejected experiments (raising `MIN_FREQ` — breaks
+Drop D / Half-step-down support; raising `NoteGate.stable_frames` — app-wide latency
+for a partial fix) stay rejected; this replaced them rather than revisiting them.
+One honest limitation, documented rather than hidden: a pull-off from the 12th fret
+to the open string lands exactly an octave down, and if it transfers almost no
+energy (quieter than 1.5x the decay floor) it will be suppressed until the string is
+re-plucked. That trade was accepted knowingly — a constant false D2 during every
+D3 decay against a rare, extremely soft octave pull-off.
 
 **Rhythm mode scores a correct answer immediately but doesn't advance until the beat
 window elapses.** `SessionEngine.advance_on_correct=False` (set for rhythm mode only,
@@ -378,6 +401,10 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `OCTAVE_PREFERENCE_RATIO` | 0.75 (real wins were 0.29-0.69, a late-decay near-tie was 0.91) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference`, `test_real_recordings.py` |
 | `OCTAVE_SEARCH_MULTIPLES` | 6 (matches the harmonic count used elsewhere: chroma, chord templates) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference` |
 | `FALLBACK_EDGE_MARGIN` | 5 samples from the true array end | `audio/pitch.py` | `test_pitch.py::TestFallbackEdgeRejection` |
+| `CENTER_TOLERANCE_CENTS` | 40 (correct real readings max out at 39c; artifacts start at 43c) | `audio/pitch.py` | `test_pitch.py::TestNoteGateCenterTolerance`, `test_real_recordings.py` |
+| `ONSET_RMS_FACTOR` | 1.5 (false-subharmonic decay ~1.0x its floor; a real re-pluck >2x) | `audio/pitch.py` | `test_pitch.py::TestNoteGateSubharmonicSuppression` |
+| `SUBHARMONIC_TOLERANCE_CENTS` | 60 (D3.wav's false lows drift 71-74Hz, up to ~50c from D2) | `audio/pitch.py` | `test_pitch.py::TestNoteGateSubharmonicSuppression` |
+| `SILENT_FRAMES_TO_FORGET` | 14 (~300ms at the app hop; must outlast brief mid-decay confidence dips) | `audio/pitch.py` | `test_pitch.py::TestNoteGateSubharmonicSuppression` |
 | `PRE_ROLL_SECONDS` (recorder) | 0.6 (tap transient measurably gone by ~0.4s in a real recording) | `scripts/record_fixtures.py` | `test_record_fixtures.py::TestPreRoll` |
 | `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
 | `METER_HOLD_MS` | 700 | `ui/modes.py` | `test_ui.py` (Tuner/FreeDetect hold tests) |
@@ -386,9 +413,9 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-799 tests (796 pass, 2 currently fail against real recordings — see Status below, this
-is the system surfacing real, not-yet-fixed detection bugs, not a broken test), ~12
-seconds, no audio hardware and no display required for the rest of the suite.
+808 tests, all passing (including all 24 real-recording assertions — the five real
+detection bugs the recorded fixtures surfaced have all been fixed), ~12 seconds, no
+audio hardware and no display required.
 
 **Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -588,18 +615,23 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   — one chromatic octave, low E string open through fret 11). The first 0.6s of each
   original recording was contaminated by the keyboard tap above; all 12 were trimmed
   in place once the bug was understood, rather than asking for a re-record.
-- This immediately found real bugs no synthetic test had: E2, A#2 and C#3 are now
-  fixed (see the octave-preference and fallback-edge-rejection design decisions
-  above). **D#3 and D3 are still failing, not yet fixed** — both diagnosed in detail
-  (see the design decision above) and found to need either more evidence (D3: is the
-  ~73Hz energy consistent across fresh recordings, or was this one take unusually
-  noisy?) or a different kind of fix entirely (D#3: real onset detection, not another
-  tau-picking heuristic) rather than a rushed patch. A global lever that was tried and
-  measured against every fixture before being rejected: raising `NoteGate.stable_frames`
-  neither cleanly fixes either case nor comes for free (real added latency on every
-  detection app-wide) — see the design decision for the actual numbers. Running
-  `pytest` right now shows 2 real failures in `test_real_recordings.py` — that's the
-  harness doing exactly what it was built for, not something to silence.
+- This immediately found real bugs no synthetic test had: **all five are now fixed
+  and the full suite passes 808/808.** E2, A#2 and C#3 were detector fixes (see the
+  octave-preference and fallback-edge-rejection design decisions above). D3 and D#3
+  turned out not to be detector bugs at all — the raw readings honestly reported
+  real signal content (a genuine ~73Hz decay resonance the guitar itself produces,
+  confirmed after the room-noise theory was ruled out; and an attack transient that
+  genuinely rings a quarter-tone sharp) — and were fixed in `NoteGate` with two
+  physics rules: no new lower note without new energy (subharmonic-switch onset
+  requirement) and no note event from a pitch parked between two note centers. See
+  the design decision above for the full story, tuning evidence, and the one known
+  accepted limitation (an extremely soft octave pull-off).
+- Worth a by-ear check on real hardware sometime: during a low note's long decay the
+  *live tuner needle* (raw per-frame path through `PitchSmoother`, not `NoteGate`)
+  can still briefly show the octave-below wobble that the note-event path now
+  suppresses. No test asserts on the raw path; if it bothers in practice, the
+  `NoteGate` approach (onset-gated subharmonic suppression) is the template, but the
+  smoother is display-only so it may genuinely not matter.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:

@@ -2,7 +2,13 @@ import numpy as np
 import pytest
 
 import synth
-from guitar_trainer.audio.pitch import NoteGate, PitchResult, PitchSmoother, YinDetector
+from guitar_trainer.audio.pitch import (
+    SILENT_FRAMES_TO_FORGET,
+    NoteGate,
+    PitchResult,
+    PitchSmoother,
+    YinDetector,
+)
 from guitar_trainer.core.notes import STANDARD, midi_to_freq, name_to_midi, note_name
 
 SR = synth.SAMPLE_RATE
@@ -531,6 +537,136 @@ class TestNoteGate:
         gate.reset()
         assert gate.current is None
         assert gate.push(self.result(69)) is None
+
+
+class TestNoteGateCenterTolerance:
+    """A stable window must sit near a note's *center* to be reported.
+
+    The real case (tests/fixtures/audio/notes/D#3.wav): a hard pluck momentarily
+    raises string tension, so the attack rang at ~160.3Hz — a quarter-tone between
+    D#3 and E3 — for ~100ms. Those frames agree with each other to within a few
+    cents, so the inter-frame tolerance check alone confirmed a wrong, stable "E3".
+    """
+
+    def make(self, **kwargs):
+        return NoteGate(rms_threshold=0.01, confidence_threshold=0.5, **kwargs)
+
+    def result(self, midi_float, *, confidence=0.9, rms=0.1):
+        return PitchResult.from_freq(midi_to_freq(midi_float), confidence, rms)
+
+    def test_a_pitch_parked_between_two_notes_never_confirms(self):
+        gate = self.make(stable_frames=3)
+        # 46 cents flat of E3 (midi 52) — self-consistent, but on no note's center.
+        for _ in range(6):
+            assert gate.push(self.result(52 - 0.46)) is None
+        assert gate.current is None
+
+    def test_confirms_once_the_attack_settles_into_the_note_core(self):
+        gate = self.make(stable_frames=3)
+        readings = []
+        # Sharp attack gliding down onto D#3 (midi 51), like the recorded take.
+        for midi_float in [51.54, 51.52, 51.49, 51.30, 51.10, 51.05, 51.03]:
+            stable = gate.push(self.result(midi_float))
+            if stable is not None:
+                readings.append(stable)
+        assert readings, "never settled after the attack transient passed"
+        assert {r.midi for r in readings} == {51}
+
+    def test_readings_inside_the_tolerance_confirm_normally(self):
+        gate = self.make(stable_frames=3)
+        stable = None
+        for _ in range(3):
+            stable = gate.push(self.result(51.30))  # +30 cents — sharp but on-note
+        assert stable is not None and stable.midi == 51
+
+
+class TestNoteGateSubharmonicSuppression:
+    """A note switch to an octave/twelfth below the held note needs a new pluck.
+
+    The real case (tests/fixtures/audio/notes/D3.wav): during D3's decay the guitar
+    itself produces a genuine ~73Hz resonance — real spectral energy, not an
+    algorithm artifact — and the detector followed it into a full second of
+    confident, wrong "D2" readings while the RMS fell monotonically. No new note is
+    physically possible without new energy, so the gate demands an energy onset
+    before believing a subharmonic-consistent drop.
+    """
+
+    def make(self, **kwargs):
+        return NoteGate(rms_threshold=0.01, confidence_threshold=0.5, **kwargs)
+
+    def result(self, midi, *, confidence=0.9, rms=0.1):
+        return PitchResult.from_freq(midi_to_freq(midi), confidence, rms)
+
+    def hold(self, gate, midi, *, rms=0.1, frames=3):
+        for _ in range(frames):
+            gate.push(self.result(midi, rms=rms))
+        assert gate.current is not None and gate.current.midi == midi
+
+    def test_octave_drop_with_no_onset_is_suppressed(self):
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 57)  # A3
+        gate.push(self.result(57, rms=0.03))
+        gate.push(self.result(57, rms=0.02))  # decaying
+        for _ in range(6):
+            assert gate.push(self.result(45, rms=0.02)) is None  # A2, no new energy
+        assert gate.current is None or gate.current.midi != 45
+
+    def test_replucked_octave_below_is_accepted(self):
+        """The onset compares against the decay floor, not the original attack —
+        a re-pluck quieter than the first note's peak must still get through."""
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 57, rms=0.1)
+        gate.push(self.result(57, rms=0.03))
+        gate.push(self.result(57, rms=0.02))
+        stable = None
+        for _ in range(3):
+            stable = gate.push(self.result(45, rms=0.05))  # > 1.5x the 0.02 floor
+        assert stable is not None and stable.midi == 45
+
+    def test_twelfth_drop_with_no_onset_is_suppressed(self):
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 69, rms=0.02)  # A4
+        for _ in range(6):
+            # D3 is a third of A4's frequency — subharmonic-consistent.
+            assert gate.push(self.result(50, rms=0.02)) is None
+
+    def test_non_subharmonic_change_needs_no_onset(self):
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 69, rms=0.02)
+        stable = None
+        for _ in range(3):
+            stable = gate.push(self.result(65, rms=0.02))  # down a major third
+        assert stable is not None and stable.midi == 65
+
+    def test_memory_survives_a_brief_confidence_dip(self):
+        """The exact leak found in D3.wav: two low-confidence frames mid-decay must
+        not count as silence and wipe the note memory, or the false subharmonic
+        confirms fresh with nothing to compare against."""
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 57)
+        gate.push(self.result(57, confidence=0.2, rms=0.02))
+        gate.push(self.result(57, confidence=0.2, rms=0.02))
+        for _ in range(6):
+            assert gate.push(self.result(45, rms=0.02)) is None
+
+    def test_sustained_silence_forgets_the_held_note(self):
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 57)
+        for _ in range(SILENT_FRAMES_TO_FORGET):
+            gate.push(None)
+        stable = None
+        for _ in range(3):
+            stable = gate.push(self.result(45, rms=0.02))  # quiet, but fresh context
+        assert stable is not None and stable.midi == 45
+
+    def test_reset_forgets_the_held_note(self):
+        gate = self.make(stable_frames=3)
+        self.hold(gate, 57)
+        gate.reset()
+        stable = None
+        for _ in range(3):
+            stable = gate.push(self.result(45, rms=0.02))
+        assert stable is not None and stable.midi == 45
 
 
 class TestEndToEnd:

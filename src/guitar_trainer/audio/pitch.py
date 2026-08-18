@@ -381,6 +381,43 @@ class YinDetector:
         return best_tau
 
 
+#: A stable window whose median reading sits further than this from its nearest note's
+#: center is not reported — it is *between* notes, not on one. The motivating case is
+#: real (tests/fixtures/audio/notes/D#3.wav): a hard pluck momentarily raises string
+#: tension, so the attack rings genuinely sharp — that take spent ~100ms at ~160.3Hz,
+#: a quarter-tone between D#3 and E3, and those frames agree with *each other* to
+#: within a few cents, so the inter-frame tolerance check waves them straight through
+#: as a confident, stable, wrong "E3". Across all recorded fixtures, readings that
+#: belong to the played note stay inside ±40 cents (worst observed: 39c, one attack
+#: frame); everything past it was an artifact (attack overshoot at +43..47c, and the
+#: detuned ~71Hz decay resonance in D3.wav reading C#2+49c). Matches tolerance_cents.
+CENTER_TOLERANCE_CENTS = 40.0
+
+#: A note switch to a subharmonic of the held note (an octave/twelfth/... below) is
+#: only believed if the signal got louder since that note confirmed — by at least this
+#: factor over the quietest frame heard since. You cannot physically sound a new lower
+#: note without putting new energy into a string; without a re-pluck, "the pitch
+#: dropped an octave mid-decay" is always the detector locking onto a subharmonic.
+#: In the recording that motivated this (D3.wav), the false D2 region decays
+#: monotonically (ratio ~1.0x); a real re-pluck after even a heavy decay is >2x.
+ONSET_RMS_FACTOR = 1.5
+
+#: How close (in cents) a new note must be to an integer division of the held note's
+#: frequency to count as subharmonic-consistent. Wide on purpose: the false low
+#: readings in D3.wav drift between 71-74Hz (up to ~50 cents from D2) because the
+#: resonance behind them isn't harmonically locked to the string.
+SUBHARMONIC_TOLERANCE_CENTS = 60.0
+
+#: How many consecutive gate-closed frames before the held-note memory (which powers
+#: the subharmonic check) is forgotten. ~300ms at the app's hop. Momentary confidence
+#: dips during a note's decay must not count as "the note ended": in D3.wav, two
+#: low-confidence frames mid-decay would otherwise wipe the memory and let the false
+#: D2 confirm fresh, with nothing left to compare it against. Holding the memory
+#: longer is safe because a *real* new low note re-plucked within this window still
+#: gets through on its onset (ONSET_RMS_FACTOR).
+SILENT_FRAMES_TO_FORGET = 14
+
+
 class NoteGate:
     """Turns a stream of per-frame results into stable note events.
 
@@ -388,6 +425,17 @@ class NoteGate:
     movement produces short bogus pitches. Requiring the pitch to hold steady for a few
     consecutive frames before accepting it is what makes practice scoring feel correct
     rather than twitchy.
+
+    Two further checks came out of real recorded fixtures rather than synthetic tests
+    (tests/fixtures/audio/notes/, see AGENTS.md):
+
+    - A stable window is only reported if it sits near a note's *center*
+      (``center_tolerance_cents``) — frame-to-frame agreement alone happily confirms
+      a pitch parked a quarter-tone between two notes, which is what a hard pluck's
+      sharp attack transient produces.
+    - A switch to a subharmonic of the held note (octave/twelfth below) requires an
+      energy onset. A new lower note needs a new pluck; without one, the "lower note"
+      is the detector following a decay resonance the instrument itself produces.
     """
 
     def __init__(
@@ -397,13 +445,21 @@ class NoteGate:
         confidence_threshold: float = 0.5,
         stable_frames: int = 3,
         tolerance_cents: float = 40.0,
+        center_tolerance_cents: float = CENTER_TOLERANCE_CENTS,
     ) -> None:
         self.rms_threshold = rms_threshold
         self.confidence_threshold = confidence_threshold
         self.stable_frames = stable_frames
         self.tolerance_cents = tolerance_cents
+        self.center_tolerance_cents = center_tolerance_cents
         self._history: deque[PitchResult] = deque(maxlen=stable_frames)
         self._current: PitchResult | None = None
+        # Unlike _current (cleared the moment readings disagree), this survives the
+        # churn of a note's decay and is only forgotten after sustained silence —
+        # it's what a subharmonic candidate is checked against.
+        self._last_note: PitchResult | None = None
+        self._min_rms_since_last: float | None = None
+        self._silent_streak = 0
 
     @property
     def current(self) -> PitchResult | None:
@@ -413,9 +469,27 @@ class NoteGate:
     def reset(self) -> None:
         self._history.clear()
         self._current = None
+        self._last_note = None
+        self._min_rms_since_last = None
+        self._silent_streak = 0
+
+    def _is_subharmonic_of_last(self, stable: PitchResult) -> bool:
+        """Whether ``stable`` sits at ~1/k of the last confirmed note's frequency."""
+        if self._last_note is None:
+            return False
+        ratio = self._last_note.freq / stable.freq
+        k = round(ratio)
+        if k < 2:
+            return False
+        return abs(1200.0 * np.log2(ratio / k)) <= SUBHARMONIC_TOLERANCE_CENTS
 
     def push(self, result: PitchResult | None) -> PitchResult | None:
         """Feed one frame. Returns the stable note, or ``None`` while unsettled."""
+        if result is not None and self._min_rms_since_last is not None:
+            # Track the decay floor on every heard frame, even ones the gate rejects
+            # below — the onset check compares against how quiet things actually got.
+            self._min_rms_since_last = min(self._min_rms_since_last, result.rms)
+
         if (
             result is None
             or result.rms < self.rms_threshold
@@ -423,7 +497,12 @@ class NoteGate:
         ):
             self._history.clear()
             self._current = None
+            self._silent_streak += 1
+            if self._silent_streak >= SILENT_FRAMES_TO_FORGET:
+                self._last_note = None
+                self._min_rms_since_last = None
             return None
+        self._silent_streak = 0
 
         self._history.append(result)
         if len(self._history) < self.stable_frames:
@@ -443,6 +522,33 @@ class NoteGate:
 
         # Report the median frame, which rejects a single outlier within the window.
         stable = sorted(self._history, key=lambda r: r.midi_float)[len(self._history) // 2]
+
+        if abs(stable.cents) > self.center_tolerance_cents:
+            # Agrees with itself, but parked between two notes — a sharp attack
+            # transient or a detuned resonance, not a note anyone played. Treat it
+            # like a still-moving pitch and wait for it to settle into a note's core.
+            newest = self._history[-1]
+            self._history.clear()
+            self._history.append(newest)
+            self._current = None
+            return None
+
+        if (
+            self._last_note is not None
+            and stable.midi != self._last_note.midi
+            and self._is_subharmonic_of_last(stable)
+            and self._min_rms_since_last is not None
+            and max(r.rms for r in self._history) < ONSET_RMS_FACTOR * self._min_rms_since_last
+        ):
+            # An octave-or-more drop with no new energy behind it: physically not a
+            # new note, just the detector following a subharmonic as the real note
+            # decays. Keep waiting; a genuine re-plucked low note clears the onset
+            # check even after a long decay.
+            return None
+
+        if self._last_note is None or stable.midi != self._last_note.midi:
+            self._min_rms_since_last = stable.rms
+        self._last_note = stable
         self._current = stable
         return stable
 
