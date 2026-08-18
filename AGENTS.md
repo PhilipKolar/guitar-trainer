@@ -430,6 +430,92 @@ matching Free Detect, the most demanding real path, rather than a practice sessi
 narrowed candidate set, which is easier, not harder. More roots/qualities can be
 added to `CHORD_PLAN` the same way later; nothing else here is specific to these nine.
 
+**First real chord recordings (E, A, D — 9 fixtures) exposed a genuine architectural
+limitation in chroma-based chord matching, investigated thoroughly and deliberately
+NOT force-fixed.** All 9 were recorded clean (author confirms no background noise,
+pick-attack transient intentionally left in — that's what a real mic normally
+picks up and must not be trimmed away). Baseline result: `Am`/`D7` recognise
+correctly; `A`/`A7`/`D` partially (correct chord readings mixed with wrong
+excursions); `E`/`Em`/`E7`/`Dm` **never** settle on the right chord at all, for the
+entire ~4s clip.
+
+Root cause, established by direct spectral inspection (not guessed): on this
+guitar/mic, an *open low string's own fundamental is extremely weak relative to its
+own harmonics* — for E.wav, E2's fundamental sits at 0.3-9% of the dominant peak
+across the whole clip (checked at t=0.30/0.60/0.85/1.50s), while E2's own 3rd
+harmonic — which lands almost exactly on B3 (247.2Hz vs B3's 246.9Hz) — plus the
+chord's real, separately-played B string, together make **B** the single dominant
+chroma bin (~98% of the unit vector's energy at points). `ChordMatcher`'s cosine
+similarity, even with harmonic-aware root-weighted templates, reliably prefers
+*whatever template best matches the single dominant peak as its root* once one bin
+this thoroughly dominates — E-major's template correctly predicts strong B content
+too (0.596, nearly tying its own E prediction of 0.607), but the *observed* E
+content is far weaker than the template expects (0.107), so a sparser B-rooted
+template (B7, Bsus4, Bdim, E5) fits the skewed reality better and wins. This is the
+same "cosine similarity favours sparse templates" issue `UNEXPLAINED_PENALTY` already
+exists to fight (see `score_all`'s docstring) — it just re-surfaces in a form that
+penalty isn't strong enough to catch, because the disagreement isn't really about
+sparse-vs-rich templates, it's that the *true root's own defining pitch class is
+barely present in the actual signal at all.*
+
+Confirmed this is fixable in principle: a proper Harmonic-Product-Spectrum bass
+scorer (sum spectral energy at f0, 2f0, 3f0, 4f0 with decay, across the guitar's
+whole bass range, not just "the loudest raw FFT peak") finds E2 as a robust,
+comfortable *second place* behind B2 throughout the clip (ratio ~0.65-0.68 of the
+best score, never lower) — so the evidence for the true root genuinely exists in
+the signal, a smarter analysis *can* see it, it's just not what `bass_pitch_class`
+(a simple "lowest peak above 25% of the loudest" search) or plain cosine matching
+surfaces on their own.
+
+**What was tried and rejected, each validated against all 9 real recordings before
+being ruled out** (not reasoned about on paper only):
+- Reducing chroma's power exponent (2.0 down to 0.75, less dynamic-range
+  compression bias): helped some frames, never cleanly fixed any chord, hurt
+  previously-working `D7`/`A7`.
+- Accumulating chroma via element-wise running max since onset (instead of the
+  existing 5-frame rolling median): uniformly worse — permanently baked in noise
+  from the pick-attack transient.
+- Preferring a lower-rooted candidate near a score tie, gated by the candidate's
+  root having *some* chroma energy (direct analogue of `_prefer_lower_octave` for
+  single notes): never let E win outright, because B's own score is *also* boosted
+  by any bonus scheme proportional to evidence — B has more raw evidence than E by
+  construction (it's both a real note *and* E's 3rd harmonic).
+- Spectral pre-emphasis (boosting bins below 300-500Hz, up to 18dB/octave): broke
+  `D`/`D7` (whose root doesn't need the boost) without ever fixing `E`.
+- Log-compressing magnitude before folding into chroma: over-corrected — a
+  dominant-7th template started winning almost universally regardless of root,
+  since a 4-note template "explains" a flattened spectrum better than any 3-note one.
+- HPS-based bass feeding a continuous `root_bonus`: root sometimes correctly
+  flipped to E, but *quality* then failed anyway (`E5`/`E7`/`Edim` instead of `E`)
+  because the major third (G#) genuinely has almost no energy in this recording
+  (chroma[G#] median 0.004 across the clip, only briefly peaking to 0.32) — there
+  isn't enough real evidence to tell E-major from a bare E5 power chord most of the
+  time, regardless of how the root is found.
+- A two-stage classifier (HPS root, then quality matched only among chords sharing
+  that root — removing the sparse-template-vs-rich-template contest since every
+  candidate in stage two already predicts the same dominant partial): got `A` much
+  closer (20/38 correct) but broke `D`/`Dm`, which were previously fine.
+- Sticky/majority-vote gating (report the mode of the last 15-30 frames rather than
+  3 consecutive identical ones): got `D7` to a single stray wrong answer, helped
+  `Am`, did nothing for `E`-family (never wins even one frame to be sticky about).
+- Every combination of the above, swept together: best found was 2 of 9 fully
+  correct at once — different chords needed contradictory settings (`A` wanted a
+  looser HPS ratio, `D` wanted a stricter one; whichever won always broke something
+  that had been working).
+
+**Conclusion: not a tuning problem.** Root detection and quality detection are two
+genuinely separate weaknesses that both need fixing, and neither has enough spare
+margin in the *current* single-vector-cosine-similarity architecture to be fixed
+without trading off against the other or against already-correct cases. A real fix
+needs a properly designed replacement — most plausibly, decoupling root detection
+(HPS-style, evidence-based, already shown above to work) from quality detection
+(targeted third/seventh presence checks once a root is trusted, not full-catalogue
+cosine matching) — validated carefully against both the real fixtures and the full
+synthetic suite, as its own piece of work, not a quick patch. `chroma.py`/`chords.py`
+are unmodified by this investigation; `tests/test_real_chords.py` correctly reports
+these as real, current failures rather than being adjusted to hide them — that's
+the harness doing what it's for, exactly per the D3/D#3 precedent above.
+
 ## Tuned constants
 
 Changing these has non-obvious consequences; the referenced tests are the safety net.
@@ -459,10 +545,13 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-827 tests: 825 passing, plus 2 skipped (`test_real_chords.py` — no chord fixtures
-recorded yet, see Status below). All 24 note real-recording assertions pass — the
-five real detection bugs the recorded fixtures surfaced have all been fixed. ~13
-seconds, no audio hardware and no display required.
+835 tests: 826 passing, 9 currently failing — all 9 in `test_real_chords.py`, one per
+recorded chord fixture (`E`, `Em`, `E7`, `A`, `A7`, `D`, `Dm` settle on a wrong chord
+at some point; `Am`/`D7` recognise correctly). This is a real, thoroughly-diagnosed,
+not-yet-fixed architectural limitation — see the design decision above — not
+something to silence. All 24 note real-recording assertions still pass; the five
+real note-detection bugs the recorded fixtures surfaced remain fixed. ~13 seconds,
+no audio hardware and no display required.
 
 **Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -688,12 +777,30 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   that Free Detect chord recognition and chord-practice scoring had never actually
   worked live at all** — `AnalysisWorker` was reading too few samples per frame for
   `ChromaAnalyser` to ever produce output, silently, since chroma was introduced. See
-  the design decision above for the full mechanism and fix. This means item 3 and
-  item 6 in the acceptance checks below were previously untestable-as-written (there
-  was nothing working to verify) and are now the most important ones to actually
-  check by ear — everything downstream of chroma is fixed on paper and by test, but
-  genuinely unverified against a real strum until someone does.
-- 827 tests: 825 passing, 2 skipped (no chord fixtures recorded yet).
+  the design decision above for the full mechanism and fix.
+- **The first real chord recordings then surfaced a second, deeper problem: on a
+  real guitar, `ChordMatcher`'s cosine-similarity matching reliably misidentifies
+  any chord rooted on the open low E string (E, Em, E7), and partially misreads A
+  and D too** — see the design decision above for the full diagnosis (a real,
+  measured weak-fundamental effect, not noise) and the long list of fixes tried and
+  rejected, none of which cleanly solved it without breaking something else that
+  was already working. **This is not fixed.** `Am` and `D7` recognise correctly;
+  `E`/`Em`/`E7`/`Dm` never settle on the right chord at all in the current
+  recordings, and `A`/`A7`/`D` are partial. `pytest` currently shows 9 real,
+  expected failures in `test_real_chords.py` — again, the harness surfacing a real
+  bug rather than something to silence. A proper fix needs a redesigned classifier
+  (decoupled root/quality detection, per the design decision) as dedicated work,
+  not a quick follow-up.
+- 835 tests: 826 passing, 9 currently failing (all in `test_real_chords.py`, all
+  understood, none silenced).
+- **Open, unreproduced report: author says Free Detect and Note Practice both fail
+  to correctly detect "an E note" live.** Not yet investigated — the only E covered
+  by a real fixture is open low E2, and that one passes
+  (`test_real_recordings.py::TestRecordedNotes[E2]`), so this is likely a *different*
+  E (E3 on the D string's 2nd fret, or open high E4 — neither has ever been
+  recorded/tested) rather than a regression of the known-good case. Needs either a
+  fresh recording of the specific E in question or the author narrowing down which
+  string/fret before it can be diagnosed the way D3/D#3 were.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -705,15 +812,14 @@ checks that still want a human with an instrument:
    to do it, not just a normal-volume comment.
 2. Tuner: each open string reads correctly, needle centres when in tune; note holds
    briefly (not abruptly) after a string stops ringing.
-3. **Free detect chord recognition — highest priority of this list.** This was
-   *completely dead* until this session (see the design decision on the
-   `AnalysisWorker` window-size bug above) — not degraded, not jumpy, producing
-   zero chord events, ever, no matter what was strummed. Strum E major repeatedly
-   and confirm it now reads as a chord promptly and consistently, not as a jumping
-   single note. Also try other open chords, and check a genuinely single note still
-   reads as a note (not misclassified as a chord) across the neck. Recording real
-   chord fixtures (`--kind chords`) and running `pytest` is the fastest way to check
-   this systematically rather than by ear alone — see `tests/test_real_chords.py`.
+3. **Free detect chord recognition — known-broken for E/Em/E7/Dm, partial for
+   A/A7/D, working for Am/D7 as of this session, do not expect a clean pass.** The
+   wiring that made chord recognition dead is fixed (see the `AnalysisWorker`
+   window-size design decision), but a second, deeper issue was found and is *not*
+   fixed (see the design decision on real chord recordings) — expect an open-position
+   E major strum specifically to read as some B-rooted chord, not E. `pytest` after
+   `--kind chords` recording is the fast way to check this precisely rather than by
+   ear — see `tests/test_real_chords.py` and don't be surprised by red output there.
 4. Note/chord practice: the Previous/Next preview should feel accurate and useful,
    not distracting; check the fade animation isn't janky on real hardware.
 5. **Rhythm mode at 60 BPM through speakers** — the click should now sound clean, not
