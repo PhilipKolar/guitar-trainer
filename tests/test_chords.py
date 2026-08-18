@@ -356,15 +356,84 @@ class TestNoteOrChordClassifier:
             assert match.chord == Chord.parse(symbol)
 
 
+class TestSingleSeriesDetection:
+    """ChromaAnalyser.single_series_pitch_class — the pre-fold check that tells a
+    single ringing string apart from a chord, which pitch-class space cannot do
+    (a weak-fundamental E2 folds to the same classes as chords do).
+    """
+
+    def analyser(self):
+        return ChromaAnalyser(SR)
+
+    def tone(self, freqs_amps, duration=0.4):
+        t = np.arange(int(SR * duration)) / SR
+        out = np.zeros_like(t)
+        for freq, amp in freqs_amps:
+            out += amp * np.sin(2 * np.pi * freq * t)
+        return (0.3 * out / np.max(np.abs(out))).astype(np.float32)
+
+    def test_a_plain_harmonic_series_is_that_note(self):
+        e2 = midi_to_freq(name_to_midi("E2"))
+        audio = self.tone([(e2, 1.0), (2 * e2, 0.8), (3 * e2, 0.6), (4 * e2, 0.3)])
+        result = self.analyser().single_series_pitch_class(audio[: CHROMA_WINDOW])
+        assert result is not None
+        pc, fraction = result
+        assert pc == name_to_pitch_class("E")
+        assert fraction > 0.9
+
+    def test_a_series_with_a_buried_fundamental_is_still_that_note(self):
+        """The real E2 case: the fundamental is far below the peak floor, only
+        harmonics 2/3/4 are visible — still one string, and still an E."""
+        e2 = midi_to_freq(name_to_midi("E2"))
+        audio = self.tone([(2 * e2, 0.5), (3 * e2, 1.0), (4 * e2, 0.3)])
+        result = self.analyser().single_series_pitch_class(audio[: CHROMA_WINDOW])
+        assert result is not None
+        assert result[0] == name_to_pitch_class("E")
+
+    def test_a_major_triad_voiced_as_harmonics_is_not_claimed_as_a_note(self):
+        """The trap: open D major (D3 A3 D4 F#4) is exactly harmonics 2,3,4,5 of a
+        sub-octave D2. The played third at k=5 is far too strong to be a decayed
+        harmonic — the claim must be refused."""
+        d2 = midi_to_freq(name_to_midi("D2"))
+        audio = self.tone([(2 * d2, 1.0), (3 * d2, 0.8), (4 * d2, 0.7), (5 * d2, 0.7)])
+        assert self.analyser().single_series_pitch_class(audio[: CHROMA_WINDOW]) is None
+
+    def test_a_power_chord_is_not_a_series(self):
+        """Root + fifth (ratio 1.5) never fits one integer-harmonic series."""
+        e2 = midi_to_freq(name_to_midi("E2"))
+        b2 = midi_to_freq(name_to_midi("B2"))
+        audio = self.tone([(e2, 1.0), (b2, 0.9), (2 * e2, 0.6), (2 * b2, 0.5)])
+        assert self.analyser().single_series_pitch_class(audio[: CHROMA_WINDOW]) is None
+
+    def test_floor_dust_cannot_break_the_fit(self):
+        """Peaks below SERIES_STRONG_PEAK are excluded from the test — quiet
+        sympathetic resonances (real recordings show them at 4-8%) must not stop a
+        clearly single note from being recognised as one."""
+        a2 = midi_to_freq(name_to_midi("A2"))
+        audio = self.tone(
+            [(a2, 1.0), (2 * a2, 0.7), (3 * a2, 0.5), (207.0, 0.06), (261.0, 0.05)]
+        )
+        result = self.analyser().single_series_pitch_class(audio[: CHROMA_WINDOW])
+        assert result is not None
+        assert result[0] == name_to_pitch_class("A")
+
+    def test_quiet_input_is_none(self):
+        silent = np.zeros(CHROMA_WINDOW, dtype=np.float32)
+        assert self.analyser().single_series_pitch_class(silent) is None
+
+
 class TestNoteOrChordGate:
     def make(self, **kwargs):
         return NoteOrChordGate(NoteOrChordClassifier(all_chords()), **kwargs)
 
-    def test_requires_consecutive_agreement(self):
-        gate = self.make(stable_frames=3)
+    def test_a_fresh_chord_needs_five_agreeing_frames(self):
+        """A strum physically takes ~100ms for all strings to sound, and half-formed
+        strums read as neighbouring chords — so a brand-new chord identity needs
+        FRESH_CHORD_FRAMES (5) agreeing frames, not the ordinary 3."""
+        gate = self.make()
         chroma = chroma_of(VOICINGS["E"])
-        assert gate.push(chroma) is None
-        assert gate.push(chroma) is None
+        for _ in range(4):
+            assert gate.push(chroma) is None
         match = gate.push(chroma)
         assert match is not None
         assert match.kind == "chord" and match.chord == Chord.parse("E")
@@ -391,25 +460,102 @@ class TestNoteOrChordGate:
         """Regression test for the actual bug: even if a couple of frames early in a
         strum look note-like before the full chord is established, the gate must not
         latch onto that transient reading and lock out the chord."""
-        gate = self.make(stable_frames=3)
+        gate = self.make()
         note_ish = chroma_of_note(name_to_midi("E2"))
         chord = chroma_of(VOICINGS["E"])
         gate.push(note_ish)
-        gate.push(chord)
-        gate.push(chord)
+        for _ in range(4):
+            gate.push(chord)
         match = gate.push(chord)
         assert match is not None
         assert match.kind == "chord"
 
-    def test_none_resets(self):
+    def test_none_clears_the_reading_but_not_instantly_the_memory(self):
         gate = self.make(stable_frames=2)
         chroma = chroma_of(VOICINGS["E"])
-        gate.push(chroma)
-        gate.push(chroma)
+        for _ in range(5):
+            gate.push(chroma)
         assert gate.current is not None
         assert gate.push(None) is None
         assert gate.current is None
 
     def test_weak_match_rejected(self):
-        gate = self.make(min_score=0.99, stable_frames=1)
+        gate = self.make(min_score=0.99, confirm_score=0.99, stable_frames=1,
+                         fresh_chord_frames=1)
         assert gate.push(chroma_of(VOICINGS["E"])) is None
+
+    def test_identity_change_mid_decay_needs_an_onset(self):
+        """The physics rule: once E major is established, a decaying signal that
+        starts template-matching some other identity (real E recordings drift to
+        Bsus4, then E5, then a bare B as strings fade) must NOT be believed —
+        nothing new was played. A genuine re-pluck (RMS rise) unlocks it."""
+        gate = self.make()
+        e_major = chroma_of(VOICINGS["E"])
+        e5 = chroma_of(VOICINGS["E5"])
+        for _ in range(5):
+            gate.push(e_major, rms=0.1)
+        assert gate.current is not None and gate.current.chord == Chord.parse("E")
+        # Decay: quieter and quieter frames that now read as E5 — all suppressed.
+        for rms in [0.08, 0.07, 0.06, 0.05, 0.05, 0.04, 0.04]:
+            assert gate.push(e5, rms=rms) is None
+        # A re-strum (clear RMS rise over the decay floor) is believed.
+        confirmed = None
+        for _ in range(5):
+            confirmed = gate.push(e5, rms=0.2)
+        assert confirmed is not None and confirmed.chord == Chord.parse("E5")
+
+    def test_power_chord_fills_in_to_the_full_chord_without_an_onset(self):
+        """Root+fifth speak first in a strum; the third emerging a few frames later
+        is the same sound event, not a new one."""
+        gate = self.make()
+        e5 = chroma_of(VOICINGS["E5"])
+        e_major = chroma_of(VOICINGS["E"])
+        for _ in range(5):
+            gate.push(e5, rms=0.1)
+        assert gate.current is not None and gate.current.chord == Chord.parse("E5")
+        confirmed = None
+        for rms in [0.09, 0.09, 0.08, 0.08, 0.08]:
+            confirmed = gate.push(e_major, rms=rms)  # decaying — no onset
+        assert confirmed is not None and confirmed.chord == Chord.parse("E")
+
+    def test_series_frames_classify_as_that_note_with_the_fit_as_confidence(self):
+        """A single-series frame is a proven single note even when the folded
+        chroma is too skewed for the note template to score well — the fit fraction
+        itself is the confidence (this is the real E2 weak-fundamental case)."""
+        gate = self.make()
+        chroma = chroma_of_note(name_to_midi("E2"))
+        confirmed = None
+        for _ in range(3):
+            confirmed = gate.push(chroma, series=(name_to_pitch_class("E"), 0.97))
+        assert confirmed is not None
+        assert confirmed.kind == "note"
+        assert confirmed.pitch_class == name_to_pitch_class("E")
+        assert confirmed.score == pytest.approx(0.97)
+
+    def test_memory_survives_loud_but_unnameable_frames(self):
+        """Frames that are loud but momentarily unclassifiable must not erode the
+        held identity's memory — only genuine quiet does."""
+        gate = self.make(forget_after=3)
+        e_major = chroma_of(VOICINGS["E"])
+        e5 = chroma_of(VOICINGS["E5"])
+        for _ in range(5):
+            gate.push(e_major, rms=0.1)
+        # Many loud-but-unnameable frames: memory must hold, so a decaying E5
+        # takeover attempt right after is still refused.
+        for _ in range(10):
+            gate.push(None, rms=0.05)
+        for _ in range(6):
+            assert gate.push(e5, rms=0.04) is None
+
+    def test_sustained_quiet_forgets_the_held_identity(self):
+        gate = self.make(forget_after=3)
+        e_major = chroma_of(VOICINGS["E"])
+        e5 = chroma_of(VOICINGS["E5"])
+        for _ in range(5):
+            gate.push(e_major, rms=0.1)
+        for _ in range(3):
+            gate.push(None, rms=0.001)  # genuine quiet
+        confirmed = None
+        for _ in range(5):
+            confirmed = gate.push(e5, rms=0.02)  # soft playing, fresh context
+        assert confirmed is not None and confirmed.chord == Chord.parse("E5")

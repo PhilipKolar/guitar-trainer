@@ -430,91 +430,91 @@ matching Free Detect, the most demanding real path, rather than a practice sessi
 narrowed candidate set, which is easier, not harder. More roots/qualities can be
 added to `CHORD_PLAN` the same way later; nothing else here is specific to these nine.
 
-**First real chord recordings (E, A, D — 9 fixtures) exposed a genuine architectural
-limitation in chroma-based chord matching, investigated thoroughly and deliberately
-NOT force-fixed.** All 9 were recorded clean (author confirms no background noise,
-pick-attack transient intentionally left in — that's what a real mic normally
-picks up and must not be trimmed away). Baseline result: `Am`/`D7` recognise
-correctly; `A`/`A7`/`D` partially (correct chord readings mixed with wrong
-excursions); `E`/`Em`/`E7`/`Dm` **never** settle on the right chord at all, for the
-entire ~4s clip.
+**First real chord recordings (E, A, D — 9 fixtures) exposed that energy-folded
+chroma cannot represent a real guitar chord, and drove a redesign of the whole
+chord-recognition path: presence chroma + a single-series veto + a physics-aware
+NoteOrChordGate.** The full story, because each piece exists for a measured reason:
 
-Root cause, established by direct spectral inspection (not guessed): on this
-guitar/mic, an *open low string's own fundamental is extremely weak relative to its
-own harmonics* — for E.wav, E2's fundamental sits at 0.3-9% of the dominant peak
-across the whole clip (checked at t=0.30/0.60/0.85/1.50s), while E2's own 3rd
-harmonic — which lands almost exactly on B3 (247.2Hz vs B3's 246.9Hz) — plus the
-chord's real, separately-played B string, together make **B** the single dominant
-chroma bin (~98% of the unit vector's energy at points). `ChordMatcher`'s cosine
-similarity, even with harmonic-aware root-weighted templates, reliably prefers
-*whatever template best matches the single dominant peak as its root* once one bin
-this thoroughly dominates — E-major's template correctly predicts strong B content
-too (0.596, nearly tying its own E prediction of 0.607), but the *observed* E
-content is far weaker than the template expects (0.107), so a sparser B-rooted
-template (B7, Bsus4, Bdim, E5) fits the skewed reality better and wins. This is the
-same "cosine similarity favours sparse templates" issue `UNEXPLAINED_PENALTY` already
-exists to fight (see `score_all`'s docstring) — it just re-surfaces in a form that
-penalty isn't strong enough to catch, because the disagreement isn't really about
-sparse-vs-rich templates, it's that the *true root's own defining pitch class is
-barely present in the actual signal at all.*
+*The diagnosis.* On this guitar, string loudness within one chord spans over 20dB —
+an open low E's fundamental measured at 0.3-9% of the loudest partial across a whole
+clip, while E2's own 3rd harmonic lands on B3 (247.2 vs 246.9Hz) and the chord's real
+B string plays too. Folding spectral *energy* (`|X|**2`) turned that into a chroma
+vector that was effectively one-hot on B — E major's evidence numerically destroyed
+before matching ever saw it. Yet the magnitude *peak list* of the same frames read
+literally B2/E3/G#3/B3: the chord was right there, in the representation the old
+pipeline squared away. Every earlier fix attempt (re-weightings, root bonuses,
+two-stage classifiers, gate stickiness — see git history) failed because it operated
+downstream of that information loss.
 
-Confirmed this is fixable in principle: a proper Harmonic-Product-Spectrum bass
-scorer (sum spectral energy at f0, 2f0, 3f0, 4f0 with decay, across the guitar's
-whole bass range, not just "the loudest raw FFT peak") finds E2 as a robust,
-comfortable *second place* behind B2 throughout the clip (ratio ~0.65-0.68 of the
-best score, never lower) — so the evidence for the true root genuinely exists in
-the signal, a smarter analysis *can* see it, it's just not what `bass_pitch_class`
-(a simple "lowest peak above 25% of the loudest" search) or plain cosine matching
-surfaces on their own.
+*Presence chroma* (`ChromaAnalyser.analyse`): fold only spectral peaks in the
+fundamental band ([MIN_FREQ, PEAK_MAX_FREQ]), each weighted by a soft-floored,
+compressed relative magnitude (`PEAK_FLOOR`, `PEAK_COMPRESSION`). The soft floor
+(subtract before compressing) matters as much as the compression: plain `rel**p`
+inflates floor-grazing dust to ~0.3 weight, which is what kept junk frames
+competitive in early prototypes. Peaks-only folding also kills the FFT leakage
+skirt that used to smear a strong peak's energy onto neighbouring pitch classes.
 
-**What was tried and rejected, each validated against all 9 real recordings before
-being ruled out** (not reasoned about on paper only):
-- Reducing chroma's power exponent (2.0 down to 0.75, less dynamic-range
-  compression bias): helped some frames, never cleanly fixed any chord, hurt
-  previously-working `D7`/`A7`.
-- Accumulating chroma via element-wise running max since onset (instead of the
-  existing 5-frame rolling median): uniformly worse — permanently baked in noise
-  from the pick-attack transient.
-- Preferring a lower-rooted candidate near a score tie, gated by the candidate's
-  root having *some* chroma energy (direct analogue of `_prefer_lower_octave` for
-  single notes): never let E win outright, because B's own score is *also* boosted
-  by any bonus scheme proportional to evidence — B has more raw evidence than E by
-  construction (it's both a real note *and* E's 3rd harmonic).
-- Spectral pre-emphasis (boosting bins below 300-500Hz, up to 18dB/octave): broke
-  `D`/`D7` (whose root doesn't need the boost) without ever fixing `E`.
-- Log-compressing magnitude before folding into chroma: over-corrected — a
-  dominant-7th template started winning almost universally regardless of root,
-  since a 4-note template "explains" a flattened spectrum better than any 3-note one.
-- HPS-based bass feeding a continuous `root_bonus`: root sometimes correctly
-  flipped to E, but *quality* then failed anyway (`E5`/`E7`/`Edim` instead of `E`)
-  because the major third (G#) genuinely has almost no energy in this recording
-  (chroma[G#] median 0.004 across the clip, only briefly peaking to 0.32) — there
-  isn't enough real evidence to tell E-major from a bare E5 power chord most of the
-  time, regardless of how the root is found.
-- A two-stage classifier (HPS root, then quality matched only among chords sharing
-  that root — removing the sparse-template-vs-rich-template contest since every
-  candidate in stage two already predicts the same dominant partial): got `A` much
-  closer (20/38 correct) but broke `D`/`Dm`, which were previously fine.
-- Sticky/majority-vote gating (report the mode of the last 15-30 frames rather than
-  3 consecutive identical ones): got `D7` to a single stray wrong answer, helped
-  `Am`, did nothing for `E`-family (never wins even one frame to be sticky about).
-- Every combination of the above, swept together: best found was 2 of 9 fully
-  correct at once — different chords needed contradictory settings (`A` wanted a
-  looser HPS ratio, `D` wanted a stricter one; whichever won always broke something
-  that had been working).
+*Single-series veto* (`ChromaAnalyser.single_series_pitch_class`): after folding,
+a weak-fundamental single note is *indistinguishable* from a chord (E2's classes
+are {E, B} with B dominant — so are plenty of chords'), so the note-vs-chord call
+is made pre-fold, in frequency space: if one harmonic series with a fundamental in
+the instrument's range explains ≥93% of strong-peak weight, it is that single note,
+with the fit fraction as its confidence. Two hard-won subtleties: (1) only peaks
+≥ `SERIES_STRONG_PEAK` participate — real recordings carry 4-8% sympathetic-string
+dust that must not break the fit; (2) a *missing-fundamental* claim (divisor > 1 —
+the whole point, since weak low strings hide their fundamentals) is only believed
+when the implied harmonic numbers stay in the root/fifth family {1,2,3,4,6,8,12}:
+an open D major (D3 A3 D4 F#4) is exactly harmonics 2,3,4,5 of a sub-octave D2,
+and the tell is that a real played third at k=5 is far too strong to be a decayed
+5th harmonic (`SERIES_CHORD_TONE_SHARE`). The synthetic D-strum caught this — the
+first veto happily called it "one note D".
 
-**Conclusion: not a tuning problem.** Root detection and quality detection are two
-genuinely separate weaknesses that both need fixing, and neither has enough spare
-margin in the *current* single-vector-cosine-similarity architecture to be fixed
-without trading off against the other or against already-correct cases. A real fix
-needs a properly designed replacement — most plausibly, decoupling root detection
-(HPS-style, evidence-based, already shown above to work) from quality detection
-(targeted third/seventh presence checks once a root is trusted, not full-catalogue
-cosine matching) — validated carefully against both the real fixtures and the full
-synthetic suite, as its own piece of work, not a quick patch. `chroma.py`/`chords.py`
-are unmodified by this investigation; `tests/test_real_chords.py` correctly reports
-these as real, current failures rather than being adjusted to hide them — that's
-the harness doing what it's for, exactly per the D3/D#3 precedent above.
+*Physics gate* (`NoteOrChordGate`, rewritten): the same "no new sound without new
+energy" reasoning as NoteGate's subharmonic rule, because real decays drift through
+neighbouring identities — a real E major's tail template-matches Bsus4, then E5,
+then a bare B note as strings fade, and *all of those scored 0.77-0.90*, so no score
+threshold separates them; only time-and-energy context does. Mechanisms, each earned
+by a specific measured failure: hysteresis (`GATE_CONFIRM_SCORE` 0.75 to establish
+vs `GATE_HOLD_SCORE` 0.5 to continue — attack near-misses like Amaj7-during-Am-strum
+sit at 0.6-0.7, settled truth at 0.75-0.96); `FRESH_CHORD_FRAMES` (5) for brand-new
+chords only (a strum needs ~100ms to sound anyway; its half-formed phase is exactly
+when richer same-root chords fit briefly); an onset requirement for identity changes,
+with the decay floor **snapshotted when the challenger appears** (first version
+compared against a floor that kept decaying under a long-open challenger window, so
+any slow decay eventually "proved" an onset — E.wav's Bsus4 walked straight through
+it); a power-chord exception (X5 → fuller same-root chord needs no onset: root+fifth
+speak first in every strum); and memory that only genuine *quiet* erodes
+(`GATE_FORGET_FRAMES`) — loud-but-unnameable frames must not erase what the sound
+was already named, or mid-decay ambiguity reopens the door the memory closed.
+
+*Wiring* (`AnalysisWorker.snapshot_ready` → `ChromaSnapshot`): the gate needs RMS
+(onset/quiet physics) and the series analysis alongside the chroma, and it must
+hear about quiet frames too (that is how its memory expires) — none of which
+`chroma_updated`, which only fires on loud frames, can carry. FreeDetectPanel
+consumes `on_snapshot`; `bass_changed`/`chroma_updated` remain for
+ChordPracticePanel, unchanged this round.
+
+**Validation, in the order that kept it honest:** every mechanism was prototyped
+against all 21 real fixtures (9 chords + 12 notes) *and* a synthetic mirror before
+touching source. Baseline before the redesign: 0/9 chord fixtures recognised, and —
+measured only because the harness forced it — **0/12 note fixtures survived the
+Free Detect path either** (E2 produced stable "note B" plus E5/B7/C7 chord readings;
+every single-note fixture hallucinated chords), which is what the author's live
+"can't detect an E note" report was. After: 9/9 and 12/12, with zero synthetic
+regressions. The constants sit on a measured plateau, not a knife edge: full 21/21
+holds across PEAK_COMPRESSION 0.35-0.40 × GATE_CONFIRM_SCORE 0.72-0.75, PEAK_FLOOR
+0.03-0.04, and GATE_ONSET_FACTOR anywhere in 1.3-1.8. Guarded by
+`test_real_chords.py` (both fixture sets through the exact live pipeline),
+`test_chords.py::TestSingleSeriesDetection` / `TestNoteOrChordGate`, and
+`test_worker.py::TestSnapshot`.
+
+Known limitations, stated rather than hidden: chord practice mode still scores via
+its own simpler streak logic on `chroma_updated` (threshold 0.75 raw matcher score)
+— it benefits from presence chroma but has no physics gate; worth a real-fixture
+pass of its own. And a genuinely soft re-strum (quieter than 1.5x the decay floor
+of what preceded it) is held to the previous identity until it either matches
+loudly enough or silence resets the memory — the same accepted trade as NoteGate's
+octave rule.
 
 ## Tuned constants
 
@@ -534,6 +534,13 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `OCTAVE_SEARCH_MULTIPLES` | 6 (matches the harmonic count used elsewhere: chroma, chord templates) | `audio/pitch.py` | `test_pitch.py::TestOctavePreference` |
 | `FALLBACK_EDGE_MARGIN` | 5 samples from the true array end | `audio/pitch.py` | `test_pitch.py::TestFallbackEdgeRejection` |
 | `CENTER_TOLERANCE_CENTS` | 40 (correct real readings max out at 39c; artifacts start at 43c) | `audio/pitch.py` | `test_pitch.py::TestNoteGateCenterTolerance`, `test_real_recordings.py` |
+| `PEAK_FLOOR` / `PEAK_COMPRESSION` | 0.04 / 0.35 (21/21 real fixtures hold across floor 0.03-0.04, power 0.35-0.40) | `audio/chroma.py` | `test_real_chords.py`, `test_chords.py` |
+| `PEAK_MAX_FREQ` | 500 Hz (covers open-voicing fundamentals up to F#4/G4; above it, h7+ spill feeds X7 templates) | `audio/chroma.py` | `test_real_chords.py` |
+| `SERIES_*` (min f0 62, tol 3%, fraction 0.93, strong-peak 0.10, chord-tone share 0.12) | see docstring | `audio/chroma.py` | `test_chords.py::TestSingleSeriesDetection` |
+| `GATE_CONFIRM_SCORE` / `GATE_HOLD_SCORE` | 0.75 / 0.5 (attack near-misses 0.6-0.7; settled truth 0.75-0.96; 21/21 holds for confirm 0.72-0.75) | `core/chords.py` | `test_real_chords.py`, `test_chords.py::TestNoteOrChordGate` |
+| `FRESH_CHORD_FRAMES` | 5 (~107ms — the half-formed-strum window) | `core/chords.py` | `test_chords.py::TestNoteOrChordGate` |
+| `GATE_ONSET_FACTOR` | 1.5 (insensitive across at least 1.3-1.8 on real fixtures) | `core/chords.py` | `test_chords.py::TestNoteOrChordGate` |
+| `GATE_FORGET_FRAMES` | 25 genuinely-quiet frames (~0.5s) | `core/chords.py` | `test_chords.py::TestNoteOrChordGate` |
 | `ONSET_RMS_FACTOR` | 1.5 (false-subharmonic decay ~1.0x its floor; a real re-pluck >2x) | `audio/pitch.py` | `test_pitch.py::TestNoteGateSubharmonicSuppression` |
 | `SUBHARMONIC_TOLERANCE_CENTS` | 60 (D3.wav's false lows drift 71-74Hz, up to ~50c from D2) | `audio/pitch.py` | `test_pitch.py::TestNoteGateSubharmonicSuppression` |
 | `SILENT_FRAMES_TO_FORGET` | 14 (~300ms at the app hop; must outlast brief mid-decay confidence dips) | `audio/pitch.py` | `test_pitch.py::TestNoteGateSubharmonicSuppression` |
@@ -545,13 +552,11 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-835 tests: 826 passing, 9 currently failing — all 9 in `test_real_chords.py`, one per
-recorded chord fixture (`E`, `Em`, `E7`, `A`, `A7`, `D`, `Dm` settle on a wrong chord
-at some point; `Am`/`D7` recognise correctly). This is a real, thoroughly-diagnosed,
-not-yet-fixed architectural limitation — see the design decision above — not
-something to silence. All 24 note real-recording assertions still pass; the five
-real note-detection bugs the recorded fixtures surfaced remain fixed. ~13 seconds,
-no audio hardware and no display required.
+861 tests, all passing — including every real-fixture assertion: 24 note
+recordings through the YIN path, 9 chord recordings and 12 note recordings through
+the Free Detect chord-recognition path (see the presence-chroma design decision for
+how the chord side went from 0/9 to 9/9). ~15 seconds, no audio hardware and no
+display required.
 
 **Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -778,29 +783,24 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   worked live at all** — `AnalysisWorker` was reading too few samples per frame for
   `ChromaAnalyser` to ever produce output, silently, since chroma was introduced. See
   the design decision above for the full mechanism and fix.
-- **The first real chord recordings then surfaced a second, deeper problem: on a
-  real guitar, `ChordMatcher`'s cosine-similarity matching reliably misidentifies
-  any chord rooted on the open low E string (E, Em, E7), and partially misreads A
-  and D too** — see the design decision above for the full diagnosis (a real,
-  measured weak-fundamental effect, not noise) and the long list of fixes tried and
-  rejected, none of which cleanly solved it without breaking something else that
-  was already working. **This is not fixed.** `Am` and `D7` recognise correctly;
-  `E`/`Em`/`E7`/`Dm` never settle on the right chord at all in the current
-  recordings, and `A`/`A7`/`D` are partial. `pytest` currently shows 9 real,
-  expected failures in `test_real_chords.py` — again, the harness surfacing a real
-  bug rather than something to silence. A proper fix needs a redesigned classifier
-  (decoupled root/quality detection, per the design decision) as dedicated work,
-  not a quick follow-up.
-- 835 tests: 826 passing, 9 currently failing (all in `test_real_chords.py`, all
-  understood, none silenced).
-- **Open, unreproduced report: author says Free Detect and Note Practice both fail
-  to correctly detect "an E note" live.** Not yet investigated — the only E covered
-  by a real fixture is open low E2, and that one passes
-  (`test_real_recordings.py::TestRecordedNotes[E2]`), so this is likely a *different*
-  E (E3 on the D string's 2nd fret, or open high E4 — neither has ever been
-  recorded/tested) rather than a regression of the known-good case. Needs either a
-  fresh recording of the specific E in question or the author narrowing down which
-  string/fret before it can be diagnosed the way D3/D#3 were.
+- **The first real chord recordings then surfaced a second, deeper problem —
+  energy-folded chroma misidentifying real chords (0/9 fixtures recognised) — which
+  drove a full redesign of the chord-recognition path: presence chroma, a
+  single-series veto, and a physics-aware NoteOrChordGate.** See the design
+  decision above for the complete story. After the redesign all 9 chord fixtures
+  and all 12 note fixtures pass through the exact live Free Detect pipeline, with
+  zero synthetic regressions, and the tuned constants sit on a measured plateau.
+- **The author's live report "Free Detect can't detect an E note" is explained and
+  fixed** (at least its Free Detect half): the baseline measurement showed *all
+  twelve* note fixtures produced wrong chord or wrong-note stables through the
+  chord-recognition path (E2 read as a stable B note plus E5/B7/C7 chords — its 3rd
+  harmonic dwarfs its fundamental on this instrument), and Free Detect's
+  chord-suppression then hid the correct YIN reading. Now guarded by
+  `test_real_chords.py::TestRecordedNotesThroughFreeDetect`. The report also
+  mentioned Note Practice failing on an E — that path is YIN-based, its E2 fixture
+  passes, and no mechanism for a failure was found there; if it recurs, narrow down
+  which string/fret (E3/E4 have never been recorded) and record it.
+- 861 tests, all passing.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -812,24 +812,23 @@ checks that still want a human with an instrument:
    to do it, not just a normal-volume comment.
 2. Tuner: each open string reads correctly, needle centres when in tune; note holds
    briefly (not abruptly) after a string stops ringing.
-3. **Free detect chord recognition — known-broken for E/Em/E7/Dm, partial for
-   A/A7/D, working for Am/D7 as of this session, do not expect a clean pass.** The
-   wiring that made chord recognition dead is fixed (see the `AnalysisWorker`
-   window-size design decision), but a second, deeper issue was found and is *not*
-   fixed (see the design decision on real chord recordings) — expect an open-position
-   E major strum specifically to read as some B-rooted chord, not E. `pytest` after
-   `--kind chords` recording is the fast way to check this precisely rather than by
-   ear — see `tests/test_real_chords.py` and don't be surprised by red output there.
+3. **Free detect — the freshest large change, now expected to actually work.**
+   All 9 recorded chords and all 12 recorded single notes pass the exact live
+   pipeline in tests, but by-ear feel (latency of the 5-frame chord confirmation,
+   the identity holding steady through a chord's decay, no phantom chords while
+   playing single notes) has never been humanly verified. Strum each recorded
+   chord and play single notes across the neck; the display should follow.
 4. Note/chord practice: the Previous/Next preview should feel accurate and useful,
    not distracting; check the fade animation isn't janky on real hardware.
 5. **Rhythm mode at 60 BPM through speakers** — the click should now sound clean, not
    distorted or cut off. This was the highest-confidence bug of this batch (the old
    behavior was provably wrong, not just untuned), but hasn't been heard for real yet.
-6. **Chord practice — also affected by the same dead-wiring bug as item 3.** Open vs
-   barre voicings; Am vs C and Em vs G not confused (this has a real bass-note signal
-   behind it). Since `chroma_updated` never fired before this session, no chord was
-   ever scored in practice mode on real hardware — confirm a strum actually advances
-   the challenge at all before worrying about voicing/confusion nuances.
+6. **Chord practice — still on the simpler streak logic (no physics gate), though
+   it now receives the much better presence chroma.** Confirm a strum actually
+   advances the challenge, then check open vs barre voicings and that Am vs C and
+   Em vs G aren't confused. If it feels flaky where Free Detect feels solid, the
+   difference is the missing physics gate — worth a real-fixture pass of its own
+   (see the design decision's known-limitations note).
 7. Settings: change a note/chord selection or a toolbar control, quit via Ctrl-C in
    the terminal within a couple seconds, relaunch — it should be remembered.
 8. Rhythm mode: play the correct note/chord well before the beat window ends — the

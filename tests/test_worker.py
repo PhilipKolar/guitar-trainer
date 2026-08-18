@@ -172,6 +172,50 @@ class TestBassOrdering:
         assert order == ["bass", "chroma"]
 
 
+class TestSnapshot:
+    """snapshot_ready is what feeds the physics-aware note-or-chord gate: it must
+    fire for EVERY processed frame — quiet ones included, since sustained quiet is
+    how the gate's identity memory expires — and carry the frame's rms."""
+
+    def test_fires_with_chroma_bass_and_series_on_a_loud_frame(self, qapp):
+        worker = make_worker(gate=0.005)
+        seen = []
+        worker.snapshot_ready.connect(seen.append)
+        midi_notes = [name_to_midi(n) for n in ["G2", "B2", "D3", "G3", "B3", "G4"]]
+        strum = synth.strum(midi_notes, duration=0.8)
+        worker._process(strum[4096 : 4096 + 8192], now=0.0)
+
+        assert len(seen) == 1
+        snapshot = seen[0]
+        assert snapshot.chroma is not None
+        assert snapshot.rms > 0.005
+        assert snapshot.series is None  # a strummed chord is not one series
+
+    def test_fires_on_quiet_frames_too_with_no_chroma(self, qapp):
+        worker = make_worker(gate=0.05)
+        seen = []
+        worker.snapshot_ready.connect(seen.append)
+        quiet = synth.sine(220.0, duration=0.3, amplitude=0.01)[:8192]
+        worker._process(quiet, now=0.0)
+
+        assert len(seen) == 1
+        assert seen[0].chroma is None
+        assert seen[0].rms > 0.0
+
+    def test_a_single_note_carries_its_series_analysis(self, qapp):
+        worker = make_worker(gate=0.005)
+        seen = []
+        worker.snapshot_ready.connect(seen.append)
+        note = synth.plucked_string(midi_to_freq(name_to_midi("A2")), duration=0.5)
+        worker._process(note[2048 : 2048 + 8192], now=0.0)
+
+        assert len(seen) == 1
+        assert seen[0].series is not None
+        pc, fraction = seen[0].series
+        assert pc == name_to_midi("A2") % 12
+        assert fraction > 0.9
+
+
 class TestSuppression:
     def test_suppression_window_blanks_everything(self, qapp):
         worker = make_worker(gate=0.001)

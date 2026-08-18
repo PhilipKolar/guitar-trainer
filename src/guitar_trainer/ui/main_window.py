@@ -236,6 +236,7 @@ class MainWindow(QMainWindow):
         worker.note_released.connect(self._on_note_released)
         worker.bass_changed.connect(self._on_bass)
         worker.chroma_updated.connect(self._on_chroma)
+        worker.snapshot_ready.connect(self._on_snapshot)
         worker.level_changed.connect(self._on_level)
         worker.error.connect(self._on_audio_error)
         self.analysis.start()
@@ -287,6 +288,11 @@ class MainWindow(QMainWindow):
         for panel in self.panels:
             if panel.active:
                 panel.on_chroma(chroma)
+
+    def _on_snapshot(self, snapshot) -> None:
+        for panel in self.panels:
+            if panel.active:
+                panel.on_snapshot(snapshot)
 
     def _on_level(self, rms: float) -> None:
         self.level_meter.set_level(rms)

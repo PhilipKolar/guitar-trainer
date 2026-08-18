@@ -306,26 +306,83 @@ class NoteOrChordClassifier:
         return NoteOrChordMatch("note", best_note_pc, None, best_note_score)
 
 
-class NoteOrChordGate:
-    """Accepts a note-or-chord classification only once it has held steadily.
+#: NoteOrChordGate hysteresis: a brand-new identity must score at least
+#: GATE_CONFIRM_SCORE to be believed, while an already-held identity keeps
+#: reporting down to GATE_HOLD_SCORE. Measured on the real fixtures: settled
+#: correct identities score ~0.75-0.96, attack-transient near-misses (Amaj7 heard
+#: mid-strum of Am, D7 mid-strum of D) sit at ~0.6-0.7 — the gap is the point.
+#: Full 9/9 chord + 12/12 note fixture recognition holds for confirm 0.72-0.75.
+GATE_CONFIRM_SCORE = 0.75
+GATE_HOLD_SCORE = 0.5
+#: A fresh *chord* needs this many consecutive agreeing frames (~107ms at the app
+#: hop) — a strum physically takes that long to sound anyway, and it is exactly the
+#: window in which half-formed strums read as a neighbouring chord. Notes and
+#: already-held identities settle in the ordinary 3.
+FRESH_CHORD_FRAMES = 5
+#: An identity change without a re-pluck is disallowed: the challenger's loudest
+#: frame must exceed this factor times the decay floor as it stood when the
+#: challenger appeared. Same physics as pitch.ONSET_RMS_FACTOR; insensitive
+#: across at least 1.3-1.8 on the real fixtures.
+GATE_ONSET_FACTOR = 1.5
+#: How many genuinely quiet frames before the held identity is forgotten (~0.5s at
+#: the app hop). Frames that are loud but momentarily unnameable do NOT count — a
+#: sound still clearly ringing must not erase the memory of what it was named.
+GATE_FORGET_FRAMES = 25
 
-    Mirrors :class:`ChordGate`, generalised over the "note" vs "chord" outcomes a
-    :class:`NoteOrChordClassifier` produces.
+
+class NoteOrChordGate:
+    """Accepts a note-or-chord classification once it has held steadily — with the
+    same physics rules :class:`~guitar_trainer.audio.pitch.NoteGate` applies to
+    single notes.
+
+    Frame-by-frame template scores alone are not enough on real audio: a decaying
+    chord drifts through neighbouring identities as strings fade (a real E major's
+    tail reads Bsus4, then E5, then a bare B), and a strum's attack transient
+    briefly resembles richer same-root chords. Neither is a new sound *event* — you
+    cannot change what is ringing without putting new energy into the strings. So:
+
+    - a held identity can only be replaced after an energy onset
+      (``GATE_ONSET_FACTOR``), except a power chord filling in to a fuller chord on
+      the same root (the normal strum attack: root+fifth speak first);
+    - a brand-new identity needs a higher score than a continuing one
+      (``GATE_CONFIRM_SCORE`` vs ``GATE_HOLD_SCORE``), and a brand-new *chord*
+      additionally needs ``FRESH_CHORD_FRAMES`` agreeing frames;
+    - a single-harmonic-series frame (see
+      ``ChromaAnalyser.single_series_pitch_class``) is classified as that note with
+      the series fit as its confidence — the template score is exactly what the
+      weak-fundamental pathology breaks, which is why the veto exists;
+    - the memory is forgotten only after sustained genuine quiet
+      (``GATE_FORGET_FRAMES``), not merely unclassifiable frames.
     """
 
     def __init__(
         self,
         classifier: NoteOrChordClassifier,
         *,
-        min_score: float = 0.35,
+        min_score: float = GATE_HOLD_SCORE,
+        confirm_score: float = GATE_CONFIRM_SCORE,
         stable_frames: int = 3,
+        fresh_chord_frames: int = FRESH_CHORD_FRAMES,
+        onset_factor: float = GATE_ONSET_FACTOR,
+        forget_after: int = GATE_FORGET_FRAMES,
+        rms_threshold: float = 0.01,
     ) -> None:
         self.classifier = classifier
         self.min_score = min_score
+        self.confirm_score = confirm_score
         self.stable_frames = stable_frames
+        self.fresh_chord_frames = fresh_chord_frames
+        self.onset_factor = onset_factor
+        self.forget_after = forget_after
+        self.rms_threshold = rms_threshold
         self._streak = 0
         self._candidate_key: tuple | None = None
         self._current: NoteOrChordMatch | None = None
+        self._held_key: tuple | None = None
+        self._min_rms_since_held: float | None = None
+        self._floor_at_window_start: float | None = None
+        self._window_max_rms = 0.0
+        self._quiet_streak = 0
 
     @property
     def current(self) -> NoteOrChordMatch | None:
@@ -335,32 +392,103 @@ class NoteOrChordGate:
         self._streak = 0
         self._candidate_key = None
         self._current = None
+        self._held_key = None
+        self._min_rms_since_held = None
+        self._floor_at_window_start = None
+        self._window_max_rms = 0.0
+        self._quiet_streak = 0
+
+    @staticmethod
+    def _key(match: NoteOrChordMatch) -> tuple:
+        return (match.kind, match.pitch_class if match.kind == "note" else match.chord)
+
+    def _compatible(self, match: NoteOrChordMatch) -> bool:
+        """Identity changes that need no onset to be believed."""
+        if self._held_key is None or self._key(match) == self._held_key:
+            return True
+        held_kind, held_value = self._held_key
+        return (
+            held_kind == "chord"
+            and match.kind == "chord"
+            and held_value.quality == "5"
+            and match.chord.root == held_value.root
+            and set(held_value.pitch_classes) <= set(match.chord.pitch_classes)
+        )
 
     def push(
-        self, chroma: np.ndarray | None, bass_pitch_class: int | None = None
+        self,
+        chroma: np.ndarray | None,
+        bass_pitch_class: int | None = None,
+        *,
+        rms: float | None = None,
+        series: tuple[int, float] | None = None,
     ) -> NoteOrChordMatch | None:
-        if chroma is None:
-            self.reset()
-            return None
+        """Feed one frame. ``rms`` powers the onset/quiet physics (pass it whenever
+        available); ``series`` is ``ChromaAnalyser.single_series_pitch_class``'s
+        result for the same frame."""
+        if rms is not None and self._min_rms_since_held is not None:
+            self._min_rms_since_held = min(self._min_rms_since_held, rms)
 
-        match = self.classifier.classify(chroma, bass_pitch_class)
-        if match is None or match.score < self.min_score:
-            self.reset()
-            return None
+        match: NoteOrChordMatch | None = None
+        if chroma is not None and (rms is None or rms >= self.rms_threshold):
+            if series is not None:
+                pitch_class, fraction = series
+                match = NoteOrChordMatch("note", pitch_class, None, fraction)
+            else:
+                match = self.classifier.classify(chroma, bass_pitch_class)
+            if match is not None:
+                threshold = (
+                    self.min_score
+                    if self._key(match) == self._held_key
+                    else self.confirm_score
+                )
+                if match.score < threshold:
+                    match = None
 
-        key = (match.kind, match.pitch_class if match.kind == "note" else match.chord)
+        if match is None:
+            self._streak = 0
+            self._candidate_key = None
+            self._current = None
+            if rms is None or rms < self.rms_threshold:
+                self._quiet_streak += 1
+                if self._quiet_streak >= self.forget_after:
+                    self._held_key = None
+                    self._min_rms_since_held = None
+            return None
+        self._quiet_streak = 0
+
+        key = self._key(match)
         if key == self._candidate_key:
             self._streak += 1
+            if rms is not None:
+                self._window_max_rms = max(self._window_max_rms, rms)
         else:
             self._candidate_key = key
             self._streak = 1
+            self._window_max_rms = rms if rms is not None else 0.0
+            # Snapshot the decay floor as the challenger appears: an onset is a
+            # rise relative to what came *before* it, not relative to however far
+            # the sound decays while the challenger's window stays open.
+            self._floor_at_window_start = self._min_rms_since_held
 
-        if self._streak >= self.stable_frames:
-            self._current = match
-            return match
+        needed = self.stable_frames
+        if match.kind == "chord" and key != self._held_key:
+            needed = self.fresh_chord_frames
+        if self._streak < needed:
+            self._current = None
+            return None
 
-        self._current = None
-        return None
+        if not self._compatible(match):
+            floor = self._floor_at_window_start
+            if floor is not None and self._window_max_rms < self.onset_factor * floor:
+                self._current = None
+                return None
+
+        if key != self._held_key:
+            self._min_rms_since_held = rms
+        self._held_key = key
+        self._current = match
+        return match
 
 
 class ChordGate:

@@ -28,7 +28,7 @@ import numpy as np
 from ..audio.capture import DEFAULT_SAMPLE_RATE, AudioCapture, list_input_devices
 from ..audio.chroma import ChromaAnalyser
 from ..audio.pitch import DEFAULT_HOP, DEFAULT_WINDOW, NoteGate, YinDetector
-from ..core.chords import Chord, ChordGate, ChordMatcher
+from ..core.chords import Chord, NoteOrChordClassifier, NoteOrChordGate, all_chords
 from ..core.notes import STANDARD, note_name
 
 #: One full chromatic octave, played on a single string (frets 0-11 on the low E) so
@@ -113,30 +113,35 @@ def sanity_check(samples: np.ndarray, expected_midi: int, sample_rate: int) -> s
 
 
 def sanity_check_chord(samples: np.ndarray, expected: Chord, sample_rate: int) -> str:
-    """Run the take through the real chord-detection path — chroma extraction plus
-    matching against every chord, not just the one expected, so a take that actually
-    reads as some *other* chord is caught right away rather than reported as a vague
-    "not this one". Scored against the full catalogue (``ChordMatcher()`` with no
-    restriction) to mirror Free Detect, the most demanding real path — a practice
-    session narrows the candidates, which is easier, not harder.
+    """Run the take through the real chord-detection path — the same
+    analyser + physics-aware note-or-chord gate Free Detect runs live, against the
+    full chord catalogue, so a take that actually reads as some *other* chord (or as
+    a single note) is caught right away rather than reported as a vague "not this
+    one". A practice session narrows the candidates, which is easier, not harder.
     """
-    analyser = ChromaAnalyser(sample_rate)
-    gate = ChordGate(ChordMatcher())
+    analyser = ChromaAnalyser(sample_rate, rms_threshold=0.01)
+    gate = NoteOrChordGate(NoteOrChordClassifier(all_chords()))
     window = max(DEFAULT_WINDOW, analyser.window)
     settled = None
     for start in range(0, len(samples) - window, DEFAULT_HOP):
         frame = samples[start : start + window]
+        rms = float(np.sqrt(np.mean(frame[-analyser.window :].astype(np.float64) ** 2)))
         chroma = analyser.analyse(frame)
         bass = analyser.bass_pitch_class(frame) if chroma is not None else None
-        stable = gate.push(chroma, bass)
+        series = analyser.single_series_pitch_class(frame) if chroma is not None else None
+        stable = gate.push(chroma, bass, rms=rms, series=series)
         if stable is not None:
             settled = stable
 
     if settled is None:
         return "no stable chord detected — too quiet, ambiguous, or didn't settle in time"
+    if settled.kind == "note":
+        from ..core.notes import pitch_class_name
+
+        return f"detected a single {pitch_class_name(settled.pitch_class)} note — expected {expected.name()}"
     if settled.chord != expected:
         return f"detected {settled.chord.name()} (score {settled.score:.2f}) — expected {expected.name()}"
-    return f"detected {settled.chord.name()} (score {settled.score:.2f}, margin {settled.margin:.2f}) — looks right"
+    return f"detected {settled.chord.name()} (score {settled.score:.2f}) — looks right"
 
 
 @dataclass(frozen=True)

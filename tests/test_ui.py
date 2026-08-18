@@ -234,6 +234,14 @@ class TestTunerPanel:
 
 
 class TestFreeDetectPanel:
+    @staticmethod
+    def snap(panel, chroma, bass=None, series=None, rms=0.1):
+        """Deliver a chroma frame the way the worker now does — as a ChromaSnapshot
+        (chroma + bass + series + rms together) via on_snapshot."""
+        from guitar_trainer.ui.worker import ChromaSnapshot
+
+        panel.on_snapshot(ChromaSnapshot(chroma, bass, series, rms))
+
     def test_shows_stable_notes(self, qapp):
         panel = FreeDetectPanel()
         panel.on_activated()
@@ -271,8 +279,8 @@ class TestFreeDetectPanel:
         panel.on_note_stable(pitch(name_to_midi("A4")))
         panel.on_note_released()
         chroma = harmonic_template(Chord.parse("Am").pitch_classes)
-        for _ in range(3):
-            panel.on_chroma(chroma)
+        for _ in range(5):
+            self.snap(panel, chroma)
         assert panel.note_label.text() == "Am"
 
     def test_history_deduplicates_repeats(self, qapp):
@@ -318,15 +326,15 @@ class TestFreeDetectPanel:
         panel = FreeDetectPanel()
         panel.on_activated()
         chroma = harmonic_template(Chord.parse("Am").pitch_classes)
-        for _ in range(3):
-            panel.on_chroma(chroma)
+        for _ in range(5):
+            self.snap(panel, chroma)
         assert panel.note_label.text() == "Am"
 
     def test_chord_requires_sustained_agreement(self, qapp):
         panel = FreeDetectPanel()
         panel.on_activated()
         chroma = harmonic_template(Chord.parse("G").pitch_classes)
-        panel.on_chroma(chroma)
+        self.snap(panel, chroma)
         assert panel.note_label.text() == "—"
 
     def test_bass_note_disambiguates_relative_pairs(self, qapp):
@@ -337,9 +345,8 @@ class TestFreeDetectPanel:
         for symbol, bass in [("C", 0), ("Am", 9)]:
             panel._gate.reset()
             chroma = harmonic_template(Chord.parse(symbol).pitch_classes)
-            panel.on_bass(bass)
-            for _ in range(3):
-                result = panel.on_chroma(chroma)
+            for _ in range(5):
+                self.snap(panel, chroma, bass=bass)
             assert panel.note_label.text() == symbol
 
     def test_a_note_that_genuinely_sounds_like_a_chord_is_shown_as_a_chord(self, qapp):
@@ -352,8 +359,8 @@ class TestFreeDetectPanel:
         panel.on_activated()
         panel.on_note_stable(pitch(name_to_midi("E3")))
         chroma = harmonic_template(Chord.parse("Am").pitch_classes)
-        for _ in range(3):
-            panel.on_chroma(chroma)
+        for _ in range(5):
+            self.snap(panel, chroma)
         assert panel.note_label.text() == "Am"
 
     def test_a_single_notes_own_chroma_does_not_get_reclassified_as_a_chord(self, qapp):
@@ -364,7 +371,7 @@ class TestFreeDetectPanel:
         panel.on_note_stable(pitch(name_to_midi("E3")))
         chroma = harmonic_template((name_to_pitch_class("E"),))
         for _ in range(3):
-            panel.on_chroma(chroma)
+            self.snap(panel, chroma)
         assert panel.note_label.text() == "E3"
 
     def test_chord_path_resumes_once_the_note_is_released(self, qapp):
@@ -373,8 +380,8 @@ class TestFreeDetectPanel:
         panel.on_note_stable(pitch(name_to_midi("E3")))
         panel.on_note_released()
         chroma = harmonic_template(Chord.parse("G").pitch_classes)
-        for _ in range(3):
-            panel.on_chroma(chroma)
+        for _ in range(5):
+            self.snap(panel, chroma)
         assert panel.note_label.text() == "G"
 
     def test_chord_emits_fretboard_highlight(self, qapp):
@@ -383,35 +390,35 @@ class TestFreeDetectPanel:
         seen = []
         panel.chord_highlight_requested.connect(seen.append)
         chroma = harmonic_template(Chord.parse("D").pitch_classes)
-        for _ in range(3):
-            panel.on_chroma(chroma)
+        for _ in range(5):
+            self.snap(panel, chroma)
         assert seen and sorted(seen[-1]) == sorted(Chord.parse("D").pitch_classes)
 
     def test_noise_is_not_shown_as_a_chord(self, qapp):
         panel = FreeDetectPanel()
         panel.on_activated()
         for _ in range(6):
-            panel.on_chroma(np.full(12, 1 / np.sqrt(12)))
+            self.snap(panel, np.full(12, 1 / np.sqrt(12)))
         assert panel.note_label.text() == "—"
 
     def test_deactivation_clears_chord_state(self, qapp):
         panel = FreeDetectPanel()
         panel.on_activated()
         chroma = harmonic_template(Chord.parse("Am").pitch_classes)
-        panel.on_chroma(chroma)
-        panel.on_chroma(chroma)
+        for _ in range(4):
+            self.snap(panel, chroma)
         panel.on_deactivated()
         panel.on_activated()
         # The in-progress streak must not carry over across a deactivation: one more
         # frame is not enough to settle a chord that hasn't just resumed from scratch.
-        panel.on_chroma(chroma)
+        self.snap(panel, chroma)
         assert panel.note_label.text() == "—"
 
     def test_inactive_panel_ignores_chroma(self, qapp):
         panel = FreeDetectPanel()
         chroma = harmonic_template(Chord.parse("Am").pitch_classes)
-        for _ in range(3):
-            panel.on_chroma(chroma)
+        for _ in range(5):
+            self.snap(panel, chroma)
         assert panel.note_label.text() == "—"
 
     def test_live_meter_readout_is_smoothed(self, qapp):

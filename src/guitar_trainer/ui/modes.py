@@ -107,6 +107,13 @@ class ModePanel(QWidget):
         matcher can read it fresh when disambiguating relative pairs like C/Am.
         """
 
+    def on_snapshot(self, snapshot) -> None:
+        """A ChromaSnapshot for every frame, quiet ones included.
+
+        Unlike ``on_chroma``/``on_bass`` this also carries the frame's RMS and the
+        single-series analysis, which the physics-aware note-or-chord gate needs.
+        """
+
 
 #: How long a live meter keeps showing its last reading after the signal drops out.
 #: A plucked note's audible sustain often decays below the noise gate well before it's
@@ -301,10 +308,15 @@ class FreeDetectPanel(ModePanel):
     def on_bass(self, pitch_class) -> None:
         self._bass = pitch_class
 
-    def on_chroma(self, chroma) -> None:
+    def on_snapshot(self, snapshot) -> None:
         if not self.active:
             return
-        match = self._gate.push(chroma, self._bass)
+        match = self._gate.push(
+            snapshot.chroma,
+            snapshot.bass_pitch_class,
+            rms=snapshot.rms,
+            series=snapshot.series,
+        )
         if match is None:
             return
         self._chroma_kind = match.kind

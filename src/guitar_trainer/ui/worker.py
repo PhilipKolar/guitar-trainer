@@ -7,12 +7,31 @@ through signals, which Qt delivers as queued calls on the GUI thread.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal
 
 from ..audio.capture import DEFAULT_SAMPLE_RATE, AudioCapture
 from ..audio.chroma import ChromaAnalyser
 from ..audio.pitch import DEFAULT_HOP, DEFAULT_WINDOW, NoteGate, PitchResult, YinDetector
+
+
+@dataclass(frozen=True)
+class ChromaSnapshot:
+    """Everything one frame's chord-recognition consumers need, delivered together.
+
+    The physics-aware NoteOrChordGate needs the frame's RMS (onset/quiet tracking)
+    and the single-series analysis alongside the chroma vector itself, and it needs
+    to hear about *quiet* frames too (that is how its memory of the held identity
+    eventually expires) — neither of which the chroma_updated signal, which only
+    fires on loud frames, can carry.
+    """
+
+    chroma: np.ndarray | None
+    bass_pitch_class: int | None
+    series: tuple[int, float] | None
+    rms: float
 
 
 class AnalysisWorker(QObject):
@@ -30,6 +49,9 @@ class AnalysisWorker(QObject):
     #: immediately before chroma_updated for the same frame, so a slot that stores it
     #: and one that consumes it can rely on the value being current.
     bass_changed = Signal(object)  # int | None
+    #: A ChromaSnapshot for every processed frame — including quiet ones, unlike
+    #: chroma_updated. Emitted after bass_changed/chroma_updated when those fire.
+    snapshot_ready = Signal(object)  # ChromaSnapshot
     #: Input level, for the meter.
     level_changed = Signal(float)
     #: Something went wrong opening or reading the stream.
@@ -152,9 +174,13 @@ class AnalysisWorker(QObject):
             self.note_released.emit()
 
         chroma = self.chroma.analyse(frame)
+        bass = series = None
         if chroma is not None:
-            self.bass_changed.emit(self.chroma.bass_pitch_class(frame))
+            bass = self.chroma.bass_pitch_class(frame)
+            series = self.chroma.single_series_pitch_class(frame)
+            self.bass_changed.emit(bass)
             self.chroma_updated.emit(chroma)
+        self.snapshot_ready.emit(ChromaSnapshot(chroma, bass, series, rms))
 
 
 class AnalysisThread:
