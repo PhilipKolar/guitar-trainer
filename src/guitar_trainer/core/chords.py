@@ -430,20 +430,24 @@ class NoteOrChordGate:
             self._min_rms_since_held = min(self._min_rms_since_held, rms)
 
         match: NoteOrChordMatch | None = None
-        if chroma is not None and (rms is None or rms >= self.rms_threshold):
-            if series is not None:
-                pitch_class, fraction = series
-                match = NoteOrChordMatch("note", pitch_class, None, fraction)
-            else:
-                match = self.classifier.classify(chroma, bass_pitch_class)
-            if match is not None:
-                threshold = (
-                    self.min_score
-                    if self._key(match) == self._held_key
-                    else self.confirm_score
-                )
-                if match.score < threshold:
-                    match = None
+        loud_enough = rms is None or rms >= self.rms_threshold
+        # series is checked independently of chroma: a single note fretted high on
+        # the neck has nowhere to appear in the (deliberately narrow, chord-tuned)
+        # chroma fold at all, so analyse() legitimately returns None for it — that
+        # must not also block the series path, which scans its own wider band.
+        if loud_enough and series is not None:
+            pitch_class, fraction = series
+            match = NoteOrChordMatch("note", pitch_class, None, fraction)
+        elif loud_enough and chroma is not None:
+            match = self.classifier.classify(chroma, bass_pitch_class)
+        if match is not None:
+            threshold = (
+                self.min_score
+                if self._key(match) == self._held_key
+                else self.confirm_score
+            )
+            if match.score < threshold:
+                match = None
 
         if match is None:
             self._streak = 0
@@ -490,62 +494,3 @@ class NoteOrChordGate:
         self._current = match
         return match
 
-
-class ChordGate:
-    """Accepts a chord only once it has been held steadily.
-
-    A strum passes through a moment of noise and, on a slow strum, through partial
-    chords as strings are still being struck. Requiring the same answer across several
-    consecutive frames with a clear margin keeps those transients from being scored.
-    """
-
-    def __init__(
-        self,
-        matcher: ChordMatcher,
-        *,
-        min_score: float = 0.82,
-        min_margin: float = 0.01,
-        stable_frames: int = 3,
-    ) -> None:
-        self.matcher = matcher
-        self.min_score = min_score
-        self.min_margin = min_margin
-        self.stable_frames = stable_frames
-        self._streak = 0
-        self._candidate: Chord | None = None
-        self._current: ChordMatch | None = None
-
-    @property
-    def current(self) -> ChordMatch | None:
-        return self._current
-
-    def reset(self) -> None:
-        self._streak = 0
-        self._candidate = None
-        self._current = None
-
-    def push(self, chroma: np.ndarray | None, bass_pitch_class: int | None = None):
-        """Feed one chroma frame. Returns the accepted chord, or ``None``."""
-        if chroma is None:
-            self.reset()
-            return None
-
-        match = self.matcher.match(chroma, bass_pitch_class)
-        if match is None or match.score < self.min_score or match.margin < self.min_margin:
-            self._streak = 0
-            self._candidate = None
-            self._current = None
-            return None
-
-        if match.chord == self._candidate:
-            self._streak += 1
-        else:
-            self._candidate = match.chord
-            self._streak = 1
-
-        if self._streak >= self.stable_frames:
-            self._current = match
-            return match
-
-        self._current = None
-        return None

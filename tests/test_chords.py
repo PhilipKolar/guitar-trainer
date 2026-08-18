@@ -6,10 +6,10 @@ from guitar_trainer.audio.chroma import CHROMA_WINDOW, ChromaAnalyser
 from guitar_trainer.core.chords import (
     COMMON_OPEN_CHORDS,
     Chord,
-    ChordGate,
     ChordMatcher,
     NoteOrChordClassifier,
     NoteOrChordGate,
+    NoteOrChordMatch,
     all_chords,
     harmonic_template,
     note_template,
@@ -56,7 +56,13 @@ def chroma_of(voicing_names, **kwargs):
 
 
 def chroma_of_note(midi: int, **kwargs) -> np.ndarray:
-    """Synthesise a single plucked note and return its chroma vector."""
+    """Synthesise a single plucked note and return its chroma vector.
+
+    Only meaningful for notes whose 2nd harmonic still falls inside the
+    chord-tuned fold band (below ~250Hz fundamentals) — the fold is deliberately
+    narrow (see PEAK_MAX_FREQ), and higher notes rely on single_series_pitch_class
+    instead. Use classify_note_like_the_app_would for a note anywhere on the neck.
+    """
     audio = synth.plucked_string(midi_to_freq(midi), duration=0.6, attack_noise=0.05, **kwargs)
     analyser = ChromaAnalyser(SR)
     result = None
@@ -65,6 +71,31 @@ def chroma_of_note(midi: int, **kwargs) -> np.ndarray:
         if out is not None:
             result = out
     assert result is not None, "no chroma produced"
+    return result
+
+
+def classify_note_like_the_app_would(midi: int, **kwargs) -> NoteOrChordMatch:
+    """Synthesise a single plucked note and classify it the way NoteOrChordGate
+    actually does: single_series_pitch_class first (the mechanism that covers the
+    whole neck), classify() as the fallback (the chord-tuned fold, which only has
+    real content for low notes) — not classify() alone, which is no longer a
+    complete guarantee on its own since the presence-chroma redesign.
+    """
+    audio = synth.plucked_string(midi_to_freq(midi), duration=0.6, attack_noise=0.05, **kwargs)
+    analyser = ChromaAnalyser(SR)
+    classifier = NoteOrChordClassifier(all_chords())
+    result = None
+    for start in range(2048, len(audio) - CHROMA_WINDOW, 1024):
+        frame = audio[start : start + CHROMA_WINDOW]
+        series = analyser.single_series_pitch_class(frame)
+        if series is not None:
+            pitch_class, fraction = series
+            result = NoteOrChordMatch("note", pitch_class, None, fraction)
+            continue
+        chroma = analyser.analyse(frame)
+        if chroma is not None:
+            result = classifier.classify(chroma)
+    assert result is not None, "never classified as anything"
     return result
 
 
@@ -202,8 +233,13 @@ class TestChromaAnalyser:
         assert len(chroma) == 12
 
     def test_single_note_peaks_on_its_pitch_class(self):
+        """220Hz (A3), not 440Hz (A4): the fold band is deliberately narrow (see
+        PEAK_MAX_FREQ) and only has room for both a note's fundamental AND its
+        2nd harmonic — which analyse()'s MIN_STRONG_PEAKS requires — when the
+        fundamental itself is low enough. Higher notes are covered instead by
+        TestNoteOrChordClassifier's classify_note_like_the_app_would cases."""
         analyser = ChromaAnalyser(SR)
-        audio = synth.plucked_string(440.0, duration=0.5)
+        audio = synth.plucked_string(220.0, duration=0.5)
         chroma = analyser.analyse(audio[2048 : 2048 + CHROMA_WINDOW])
         assert chroma is not None
         assert int(np.argmax(chroma)) == name_to_pitch_class("A")
@@ -213,6 +249,21 @@ class TestChromaAnalyser:
         audio = synth.strum([name_to_midi(n) for n in VOICINGS["G"]], duration=0.8)
         bass = analyser.bass_pitch_class(audio[4096 : 4096 + CHROMA_WINDOW])
         assert bass == name_to_pitch_class("G")
+
+    def test_a_lone_tone_produces_no_chroma_at_all(self):
+        """MIN_STRONG_PEAKS: a signal with only one real spectral peak is treated
+        as no content, same as silence — this is what a real live report turned
+        out to be (an incidental environmental tone confidently read as a note)."""
+        analyser = ChromaAnalyser(SR, rms_threshold=0.01)
+        t = np.arange(CHROMA_WINDOW) / SR
+        pure = (0.2 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+        assert analyser.analyse(pure) is None
+        assert analyser.single_series_pitch_class(pure) is None
+
+    def test_a_real_note_with_two_peaks_still_produces_chroma(self):
+        analyser = ChromaAnalyser(SR, rms_threshold=0.01)
+        audio = synth.plucked_string(220.0, duration=0.5)
+        assert analyser.analyse(audio[2048 : 2048 + CHROMA_WINDOW]) is not None
 
     def test_bass_pitch_class_on_silence(self):
         analyser = ChromaAnalyser(SR)
@@ -224,37 +275,6 @@ class TestChromaAnalyser:
         analyser.analyse(audio[4096 : 4096 + CHROMA_WINDOW])
         analyser.reset()
         assert not analyser._history
-
-
-class TestChordGate:
-    def test_requires_consecutive_agreement(self):
-        gate = ChordGate(ChordMatcher(), stable_frames=3)
-        chroma = chroma_of(VOICINGS["E"])
-        assert gate.push(chroma) is None
-        assert gate.push(chroma) is None
-        match = gate.push(chroma)
-        assert match is not None and match.chord == Chord.parse("E")
-
-    def test_changing_answer_restarts_the_streak(self):
-        gate = ChordGate(ChordMatcher(), stable_frames=3)
-        e, a = chroma_of(VOICINGS["E"]), chroma_of(VOICINGS["Am"])
-        gate.push(e)
-        gate.push(a)
-        gate.push(e)
-        assert gate.current is None
-
-    def test_none_resets(self):
-        gate = ChordGate(ChordMatcher(), stable_frames=2)
-        chroma = chroma_of(VOICINGS["E"])
-        gate.push(chroma)
-        gate.push(chroma)
-        assert gate.current is not None
-        assert gate.push(None) is None
-        assert gate.current is None
-
-    def test_weak_match_rejected(self):
-        gate = ChordGate(ChordMatcher(), min_score=0.99, stable_frames=1)
-        assert gate.push(chroma_of(VOICINGS["E"])) is None
 
 
 def _common():
@@ -289,11 +309,12 @@ class TestNoteOrChordClassifier:
         "note", ["E2", "A2", "D3", "G3", "B3", "E4", "A4", "C4", "E3", "G2", "B2"]
     )
     def test_single_notes_are_classified_as_notes(self, note):
+        """Through the same two-mechanism path the app actually uses (series
+        first, the chord-tuned fold as fallback) — classify() alone is no longer
+        a complete guarantee for every note on the neck, only single_series_
+        pitch_class is (see PEAK_MAX_FREQ vs SERIES_MAX_FREQ)."""
         midi = name_to_midi(note)
-        chroma = chroma_of_note(midi)
-        classifier = NoteOrChordClassifier(all_chords())
-        match = classifier.classify(chroma)
-        assert match is not None
+        match = classify_note_like_the_app_would(midi)
         assert match.kind == "note", (
             f"{note} misclassified as a chord (score {match.score:.3f})"
         )
@@ -398,6 +419,20 @@ class TestSingleSeriesDetection:
         audio = self.tone([(2 * d2, 1.0), (3 * d2, 0.8), (4 * d2, 0.7), (5 * d2, 0.7)])
         assert self.analyser().single_series_pitch_class(audio[: CHROMA_WINDOW]) is None
 
+    def test_a_real_seventh_harmonic_does_not_veto_a_genuine_single_note(self):
+        """The chord-tone veto's first version excluded every harmonic number
+        outside a hand-picked "safe" set {1,2,3,4,6,8,12} — which wrongly caught
+        k=7, a perfectly ordinary string partial, and broke a real recorded E2
+        (measured: its 7th harmonic legitimately carries ~20% of its strong-peak
+        weight). Only k%5==0 (5, 10, 15...) aliases to a major third, which is the
+        one interval a natural harmonic series cannot otherwise produce — that is
+        the actual danger this veto exists to catch, not general richness."""
+        e2 = midi_to_freq(name_to_midi("E2"))
+        audio = self.tone([(2 * e2, 0.6), (3 * e2, 1.0), (7 * e2, 0.4)])
+        result = self.analyser().single_series_pitch_class(audio[:CHROMA_WINDOW])
+        assert result is not None
+        assert result[0] == name_to_pitch_class("E")
+
     def test_a_power_chord_is_not_a_series(self):
         """Root + fifth (ratio 1.5) never fits one integer-harmonic series."""
         e2 = midi_to_freq(name_to_midi("E2"))
@@ -420,6 +455,20 @@ class TestSingleSeriesDetection:
     def test_quiet_input_is_none(self):
         silent = np.zeros(CHROMA_WINDOW, dtype=np.float32)
         assert self.analyser().single_series_pitch_class(silent) is None
+
+    def test_finds_a_high_note_the_chord_fold_band_cannot_represent_at_all(self):
+        """The real bug: A4 (440Hz)'s 2nd harmonic (880Hz) sits above the
+        chord-tuned fold band (PEAK_MAX_FREQ=500) entirely, so analyse() legitimately
+        has nothing to fold for it — but single_series_pitch_class scans its own,
+        much wider band (SERIES_MAX_FREQ) and must still find it. Regression test
+        for every synthesised note above ~B4 going undetected."""
+        analyser = self.analyser()
+        audio = self.tone([(440.0, 1.0), (880.0, 0.5), (1320.0, 0.3)])
+        frame = audio[:CHROMA_WINDOW]
+        assert analyser.analyse(frame) is None  # confirms the fold really is empty
+        result = analyser.single_series_pitch_class(frame)
+        assert result is not None
+        assert result[0] == name_to_pitch_class("A")
 
 
 class TestNoteOrChordGate:
@@ -531,6 +580,19 @@ class TestNoteOrChordGate:
         assert confirmed.kind == "note"
         assert confirmed.pitch_class == name_to_pitch_class("E")
         assert confirmed.score == pytest.approx(0.97)
+
+    def test_series_is_used_even_when_chroma_is_none(self):
+        """A note fretted high on the neck has nowhere to appear in the
+        deliberately narrow chord-tuned fold (analyse() legitimately returns None
+        for it), but single_series_pitch_class's own wider scan still finds it —
+        the gate must use that, not treat a None chroma as no evidence at all."""
+        gate = self.make()
+        confirmed = None
+        for _ in range(3):
+            confirmed = gate.push(None, series=(name_to_pitch_class("A"), 0.95))
+        assert confirmed is not None
+        assert confirmed.kind == "note"
+        assert confirmed.pitch_class == name_to_pitch_class("A")
 
     def test_memory_survives_loud_but_unnameable_frames(self):
         """Frames that are loud but momentarily unclassifiable must not erode the

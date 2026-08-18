@@ -34,8 +34,6 @@ from ..core.chords import (
     CHORD_QUALITIES,
     QUALITY_SUFFIX,
     Chord,
-    ChordGate,
-    ChordMatcher,
     NoteOrChordClassifier,
     NoteOrChordGate,
     all_chords,
@@ -824,10 +822,7 @@ class ChordPracticePanel(PracticePanel):
 
     def __init__(self, config, parent: QWidget | None = None) -> None:
         super().__init__(config, parent)
-        self._matcher = ChordMatcher()
-        self._last_bass: int | None = None
-        self._streak = 0
-        self._candidate: Chord | None = None
+        self._gate = NoteOrChordGate(NoteOrChordClassifier())
 
     def challenge_selector(self) -> QWidget:
         box = QGroupBox("Chords to practise")
@@ -935,34 +930,28 @@ class ChordPracticePanel(PracticePanel):
 
         # Score only against the chords being drilled. Restricting the candidate set
         # removes most of the near-misses that make full 120-chord matching hard —
-        # nothing can be mistaken for a chord that isn't in the exercise.
-        self._matcher = ChordMatcher(chords)
+        # nothing can be mistaken for a chord that isn't in the exercise. Still
+        # scored via NoteOrChordClassifier, not a bare ChordMatcher: a strum that
+        # genuinely reads as a single note (weak-fundamental low strings, or
+        # someone plucking one string while getting into position) must not be
+        # forced into "the closest drilled chord" the way scoring only against
+        # chords would — see the design decision on the presence-chroma redesign.
+        self._gate = NoteOrChordGate(NoteOrChordClassifier(chords))
         return chord_challenges(chords)
 
     def on_new_challenge(self, challenge) -> None:
-        self._streak = 0
-        self._candidate = None
+        self._gate.reset()
         self.highlight_requested.emit(None)
 
-    def on_chroma(self, chroma) -> None:
-        if not (self.active and self.engine and chroma is not None):
+    def on_snapshot(self, snapshot) -> None:
+        if not (self.active and self.engine):
             return
-
-        match = self._matcher.match(chroma, self._last_bass)
-        if match is None or match.score < 0.75:
-            self._streak = 0
-            self._candidate = None
+        match = self._gate.push(
+            snapshot.chroma,
+            snapshot.bass_pitch_class,
+            rms=snapshot.rms,
+            series=snapshot.series,
+        )
+        if match is None or match.kind != "chord":
             return
-
-        if match.chord == self._candidate:
-            self._streak += 1
-        else:
-            self._candidate = match.chord
-            self._streak = 1
-
-        # Hold for several frames so a slow strum isn't scored mid-way through.
-        if self._streak >= 3:
-            self.engine.submit(match, label=match.chord.name())
-
-    def on_bass(self, pitch_class) -> None:
-        self._last_bass = pitch_class
+        self.engine.submit(match, label=match.chord.name())

@@ -13,9 +13,28 @@ import numpy as np
 SAMPLE_RATE = 48000
 
 
-def sine(freq: float, duration: float = 0.2, sr: int = SAMPLE_RATE, amplitude: float = 0.3):
+def sine(
+    freq: float,
+    duration: float = 0.2,
+    sr: int = SAMPLE_RATE,
+    amplitude: float = 0.3,
+    second_harmonic: float = 0.15,
+):
+    """A "clean tone" test signal — not a literally pure sine by default.
+
+    A perfectly pure single-frequency tone doesn't occur on a guitar, and the
+    detector now rejects one outright on purpose: it's indistinguishable from a
+    lone environmental tone (mains hum, a fan/PSU whine) that a quiet room's
+    residual noise floor can genuinely contain (see MIN_SECOND_HARMONIC_RATIO in
+    audio/pitch.py). ``second_harmonic`` adds a small, real 2nd-harmonic component
+    so this still serves every test that treats it as "the simplest clean tone" —
+    0.15 sits comfortably above the detector's 0.05 floor without meaningfully
+    complicating the signal. Pass 0.0 to opt back into a mathematically pure tone.
+    """
     t = np.arange(int(duration * sr)) / sr
-    return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    wave = np.sin(2 * np.pi * freq * t) + second_harmonic * np.sin(2 * np.pi * 2 * freq * t)
+    wave /= 1.0 + second_harmonic
+    return (amplitude * wave).astype(np.float32)
 
 
 def sawtooth(freq: float, duration: float = 0.2, sr: int = SAMPLE_RATE, amplitude: float = 0.3):

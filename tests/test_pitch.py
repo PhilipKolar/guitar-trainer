@@ -319,6 +319,60 @@ class TestPurityFilter:
         assert lenient.min_harmonic_ratio == 0.0
 
 
+class TestSecondHarmonicRequirement:
+    """A detection must have real energy at its own 2nd harmonic, not just purity.
+
+    Found via a real live report: in a quiet room, an incidental environmental tone
+    (mains hum, a fan/PSU whine — one clean, stable frequency) was confidently
+    reported as a played note. DEFAULT_MIN_HARMONIC_RATIO alone can't catch this: a
+    single pure tone has *nothing else* in its spectrum, so it trivially scores
+    ratio=1.0 ("100% of the energy sits at multiples of the fundamental" — true, but
+    only because there's a total of one partial to place). A real plucked string
+    always excites more than its fundamental, even when that fundamental is weak.
+    """
+
+    def test_a_lone_pure_tone_is_rejected_even_with_perfect_purity(self, detector):
+        t = np.arange(WINDOW) / SR
+        pure = (0.2 * np.sin(2 * np.pi * 150.0 * t)).astype(np.float32)
+        assert detector.detect(pure) is None
+
+    def test_rejected_regardless_of_frequency(self, detector):
+        t = np.arange(WINDOW) / SR
+        for freq in [82.4, 220.0, 400.0, 660.0, 1000.0]:
+            pure = (0.2 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+            assert detector.detect(pure) is None, f"{freq}Hz pure tone was accepted"
+
+    @pytest.mark.parametrize("note", ["E2", "A2", "D3", "G3", "B3", "E4"])
+    def test_real_notes_still_pass(self, detector, note):
+        """The filter must not cost accuracy on genuine notes anywhere on the
+        neck — a synthesised plucked string always has real 2nd-harmonic energy."""
+        midi = name_to_midi(note)
+        signal = synth.plucked_string(midi_to_freq(midi), duration=0.4, attack_noise=0.05)
+        result = detector.detect(signal[2048 : 2048 + WINDOW])
+        assert result is not None
+        assert result.midi == midi
+
+    def test_a_note_near_the_top_of_the_range_is_not_penalised(self, detector):
+        """MAX_FREQ=1400, so 2x freq can approach or exceed Nyquist for the very
+        highest notes — _has_second_harmonic must not penalise what it can't even
+        represent."""
+        midi = name_to_midi("D6")  # near the top of the practical range
+        signal = synth.plucked_string(midi_to_freq(midi), duration=0.3, attack_noise=0.05)
+        result = detector.detect(signal[2048 : 2048 + WINDOW])
+        assert result is not None
+        assert result.midi == midi
+
+    def test_a_weak_but_real_second_harmonic_still_passes(self, detector):
+        """The floor (0.05) is deliberately low — it only needs to rule out
+        *zero*, not demand a strong harmonic."""
+        t = np.arange(WINDOW) / SR
+        freq = 220.0
+        weak = 0.2 * np.sin(2 * np.pi * freq * t) + 0.015 * np.sin(2 * np.pi * 2 * freq * t)
+        result = detector.detect(weak.astype(np.float32))
+        assert result is not None
+        assert result.midi == name_to_midi("A3")
+
+
 class TestPitchSmoother:
     """Live-display smoothing for the Tuner and Free Detect meters.
 
@@ -464,9 +518,14 @@ class TestPitchResult:
         assert result.cents == pytest.approx(20.0, abs=5.0)
 
     def test_confidence_is_higher_for_clean_signals(self, detector):
+        # 5dB SNR (the previous level here) now legitimately fails outright rather
+        # than scoring low: it's noisy enough to swamp the small 2nd-harmonic
+        # component MIN_SECOND_HARMONIC_RATIO requires, same as it would for a real
+        # signal — see TestSecondHarmonicRequirement. 10dB is still clearly noisier
+        # than clean but keeps this test about confidence, not that other check.
         clean = detector.detect(synth.sine(220.0, duration=0.2)[:WINDOW])
         noisy = detector.detect(
-            synth.add_noise(synth.sine(220.0, duration=0.2), 5)[:WINDOW]
+            synth.add_noise(synth.sine(220.0, duration=0.2), 10)[:WINDOW]
         )
         assert clean is not None and noisy is not None
         assert clean.confidence > noisy.confidence

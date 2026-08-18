@@ -33,11 +33,27 @@ CHROMA_FFT_SIZE = 16384
 MIN_FREQ = 75.0
 MAX_FREQ = 2000.0
 
-#: Peaks are taken from [MIN_FREQ, this] — the band where guitar chord voicings put
-#: their string fundamentals (up to F#4/G4 for open D/Dsus4 shapes). Above it, higher
-#: harmonics add spill classes (a 7th harmonic lands a minor 7th up, feeding X7
-#: templates) without adding information the fundamentals don't already carry.
+#: Peaks folded into the chord-matching chroma vector are taken from
+#: [MIN_FREQ, this] — the band where guitar chord voicings put their string
+#: fundamentals (up to F#4/G4 for open D/Dsus4 shapes). Deliberately narrow:
+#: widening it to catch a high single note's own fundamental (see SERIES_MAX_FREQ
+#: instead, which handles that separately) measurably reintroduced the exact E/A/D
+#: chord confusion this whole redesign exists to fix — higher-frequency content
+#: that is real on a chord (a string's own 5th/6th/7th harmonic) dilutes the fold
+#: enough to tip a close match the wrong way. Validated at 9/9 real chord fixtures
+#: with this value; do not widen it to solve a note problem, see below instead.
 PEAK_MAX_FREQ = 500.0
+
+#: single_series_pitch_class scans its OWN, much wider band — up to comfortably
+#: above the guitar's highest fret's 2nd harmonic (D6, ~1175Hz open-string-plus-22,
+#: 2nd harmonic ~2349Hz). A single note's evidence has nowhere to go but up from
+#: its own fundamental, so unlike the chord fold this band cannot be narrow: capping
+#: it at PEAK_MAX_FREQ silently broke recognition of every synthesised note above
+#: ~B4, since above roughly 500Hz there was no band left for even the *fundamental*
+#: to appear in, before any question of harmonics. This is why the two peak scans
+#: are independent rather than one shared band — no single width is correct for
+#: both a strummed open chord and a single note fretted anywhere on the neck.
+SERIES_MAX_FREQ = 3000.0
 #: A peak must reach this fraction of the band's strongest peak to count at all.
 #: Below it is the noise floor / FFT leakage skirt, not a string.
 PEAK_FLOOR = 0.04
@@ -62,6 +78,19 @@ SERIES_STRONG_PEAK = 0.10
 #: When the claimed fundamental itself is missing (see the method docstring), weight
 #: at chord-tone harmonic numbers (5, 7, ...) above this share vetoes the claim.
 SERIES_CHORD_TONE_SHARE = 0.12
+
+#: Fewer than this many strong peaks in the fundamental band is treated as no real
+#: content at all, same as silence — the frame carries no chord/note evidence.
+#: Without this, a single clean environmental tone (mains hum, a fan/PSU whine —
+#: anything with one stable, real frequency, which a quiet room's residual noise
+#: often has) trivially "fits" one harmonic series (nothing else to disagree with
+#: it, so single_series_pitch_class's fit fraction hits 1.0) and separately
+#: cosine-matches some sparse chord/note template well enough to confirm — measured
+#: on real synthetic probes: a single 150Hz tone at just-above-gate RMS was
+#: confirmed as a stable "D" note at score 1.0. Every real recorded fixture's
+#: confirmed stable frame had at least 2 peaks (notes) or 6 (chords), so 2 costs
+#: nothing there.
+MIN_STRONG_PEAKS = 2
 
 
 def _build_pitch_class_matrix(
@@ -115,27 +144,35 @@ class ChromaAnalyser:
         freqs = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
         self._peak_band = np.flatnonzero((freqs >= min_freq) & (freqs <= PEAK_MAX_FREQ))
         self._peak_band_freqs = freqs[self._peak_band]
+        self._series_band = np.flatnonzero((freqs >= min_freq) & (freqs <= SERIES_MAX_FREQ))
+        self._series_band_freqs = freqs[self._series_band]
 
     def reset(self) -> None:
         self._history.clear()
 
-    def _band_peaks(self, segment: np.ndarray):
-        """Spectral peaks in the fundamental band: (bin indices, freqs, weights).
-
-        Weights are soft-floored compressed relative magnitudes — see PEAK_FLOOR /
-        PEAK_COMPRESSION. Returns ``(None, None, None)`` when nothing peaks.
-        """
-        magnitude = np.abs(np.fft.rfft(segment * self._hann, self.fft_size))
-        band_mag = magnitude[self._peak_band]
+    def _peaks_in(self, magnitude: np.ndarray, band, band_freqs):
+        """Shared peak-finding logic over an arbitrary (bin-index, freq) band pair
+        — see _band_peaks and single_series_pitch_class for the two bands used."""
+        band_mag = magnitude[band]
         top = band_mag.max() if band_mag.size else 0.0
         if top <= 0:
             return None, None, None
         peaks, _ = find_peaks(band_mag, height=PEAK_FLOOR * top)
-        if peaks.size == 0:
+        if peaks.size < MIN_STRONG_PEAKS:
             return None, None, None
         rel = band_mag[peaks] / top
         weights = ((rel - PEAK_FLOOR) / (1.0 - PEAK_FLOOR)) ** PEAK_COMPRESSION
-        return self._peak_band[peaks], self._peak_band_freqs[peaks], weights
+        return band[peaks], band_freqs[peaks], weights
+
+    def _band_peaks(self, segment: np.ndarray):
+        """Spectral peaks in the chord-fold band: (bin indices, freqs, weights).
+
+        Weights are soft-floored compressed relative magnitudes — see PEAK_FLOOR /
+        PEAK_COMPRESSION. Returns ``(None, None, None)`` when nothing peaks, or
+        fewer than MIN_STRONG_PEAKS do (see that constant).
+        """
+        magnitude = np.abs(np.fft.rfft(segment * self._hann, self.fft_size))
+        return self._peaks_in(magnitude, self._peak_band, self._peak_band_freqs)
 
     def analyse(self, frame: np.ndarray) -> np.ndarray | None:
         """Return a smoothed unit-norm chroma vector, or ``None`` if the input is quiet.
@@ -197,7 +234,8 @@ class ChromaAnalyser:
         segment = frame[-self.window :].astype(np.float64)
         if float(np.sqrt(np.mean(segment**2))) < self.rms_threshold:
             return None
-        bins, freqs, weights = self._band_peaks(segment)
+        magnitude = np.abs(np.fft.rfft(segment * self._hann, self.fft_size))
+        bins, freqs, weights = self._peaks_in(magnitude, self._series_band, self._series_band_freqs)
         if bins is None:
             return None
 
@@ -219,7 +257,16 @@ class ChromaAnalyser:
             if explained < SERIES_MIN_FRACTION:
                 continue
             if divisor > 1:
-                chord_tone_k = fits & ~np.isin(k, (1, 2, 3, 4, 6, 8, 12))
+                # A natural harmonic series cannot produce a minor third at all, and
+                # produces a major third *only* at k=5 (and its octave-doublings,
+                # 10, 15, ...) — every other harmonic number's pitch class is a
+                # unison or a fifth, which is not what distinguishes a chord's
+                # quality. So k%5==0 is specifically "this could be a played third
+                # in disguise", not a general harmonic-richness suspicion — e.g. a
+                # real k=7 ("harmonic 7th") is just an ordinary string partial and
+                # must not count against the fit (measured on a real E2 recording:
+                # excluding it as broadly as k=7 too wrongly rejected the note).
+                chord_tone_k = fits & (k % 5 == 0)
                 if weights[chord_tone_k].sum() > SERIES_CHORD_TONE_SHARE * total:
                     continue
             pitch_class = int(round(69.0 + 12.0 * np.log2(f0 / 440.0))) % 12

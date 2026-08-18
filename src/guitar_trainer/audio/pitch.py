@@ -58,6 +58,20 @@ DEFAULT_MIN_HARMONIC_RATIO = 0.6
 HARMONIC_CHECK_MAX_FREQ = 6000.0
 HARMONIC_CHECK_HARMONICS = 12
 
+#: A detected pitch must have real energy at its own 2nd harmonic, at least this
+#: fraction of the frame's spectral peak, or it is rejected outright. A single clean
+#: sine tone — mains hum, a fan/PSU whine, any incidental electrical or mechanical
+#: tone in a quiet room — has *zero* energy there (measured: exactly 0.000 across
+#: several test frequencies) and was otherwise accepted with perfect confidence and
+#: perfect harmonic_ratio (both purity checks above are trivially satisfied by a
+#: signal with nothing else present to be "impure"). A real plucked string always
+#: excites more than its fundamental, even a weak one: measured worst case across
+#: every real recorded note fixture's confirmed frames was 0.194 (a late-decay E2),
+#: and across the full synthesised neck was 0.403. 0.05 sits with wide margin below
+#: both while cleanly rejecting the zero-energy pure-tone case. See
+#: test_pitch.py::TestSecondHarmonicRequirement.
+MIN_SECOND_HARMONIC_RATIO = 0.05
+
 
 @dataclass(frozen=True)
 class PitchResult:
@@ -205,6 +219,9 @@ class YinDetector:
         if not self._has_energy_at(frame, freq):
             return None
 
+        if not self._has_second_harmonic(frame, freq):
+            return None
+
         harmonic_ratio = self._harmonic_energy_ratio(frame, freq)
         if harmonic_ratio < self.min_harmonic_ratio:
             return None
@@ -252,6 +269,30 @@ class YinDetector:
             harmonic_energy += power[lo:hi].sum()
 
         return float(min(1.0, harmonic_energy / total))
+
+    def _has_second_harmonic(self, frame: np.ndarray, freq: float) -> bool:
+        """Reject a "detection" that is really a single pure tone with nothing else
+        in the spectrum — see MIN_SECOND_HARMONIC_RATIO. A genuine plucked string
+        always has one; an incidental environmental tone (hum, whine, coil noise)
+        usually does not.
+        """
+        windowed = frame.astype(np.float64) * np.hanning(len(frame))
+        magnitude = np.abs(np.fft.rfft(windowed))
+        bin_width = self.sample_rate / len(frame)
+
+        peak = magnitude[1:].max() if len(magnitude) > 1 else 0.0
+        if peak <= 0.0:
+            return False
+
+        target = 2.0 * freq
+        nyquist = self.sample_rate / 2.0
+        if target >= nyquist:
+            return True  # no 2nd harmonic is representable — don't penalise for it
+
+        center = target / bin_width
+        lo = max(0, int(center) - 2)
+        hi = min(len(magnitude), int(center) + 3)
+        return bool(magnitude[lo:hi].max() >= MIN_SECOND_HARMONIC_RATIO * peak)
 
     def _has_energy_at(self, frame: np.ndarray, freq: float, *, floor: float = 0.02) -> bool:
         """Reject periods that are a subharmonic of the real fundamental.

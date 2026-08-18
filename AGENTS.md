@@ -71,7 +71,7 @@ src/guitar_trainer/
     metronome.py        sample-accurate click track + BeatCounter
   core/
     notes.py            freq/MIDI/name, cents, Tuning, fretboard geometry
-    chords.py           Chord model, harmonic templates, matcher, ChordGate
+    chords.py           Chord model, harmonic templates, matcher, NoteOrChordGate
     session.py          Challenge protocol, ChallengePicker, SessionEngine
     config.py           TOML settings (XDG config dir)
     stats.py            SQLite attempt log + weakness weights
@@ -508,13 +508,71 @@ holds across PEAK_COMPRESSION 0.35-0.40 × GATE_CONFIRM_SCORE 0.72-0.75, PEAK_FL
 `test_chords.py::TestSingleSeriesDetection` / `TestNoteOrChordGate`, and
 `test_worker.py::TestSnapshot`.
 
-Known limitations, stated rather than hidden: chord practice mode still scores via
-its own simpler streak logic on `chroma_updated` (threshold 0.75 raw matcher score)
-— it benefits from presence chroma but has no physics gate; worth a real-fixture
-pass of its own. And a genuinely soft re-strum (quieter than 1.5x the decay floor
-of what preceded it) is held to the previous identity until it either matches
-loudly enough or silence resets the memory — the same accepted trade as NoteGate's
-octave rule.
+Known limitation, stated rather than hidden: a genuinely soft re-strum (quieter
+than 1.5x the decay floor of what preceded it) is held to the previous identity
+until it either matches loudly enough or silence resets the memory — the same
+accepted trade as NoteGate's octave rule.
+
+**Chord practice mode was moved onto the same `NoteOrChordGate` Free Detect uses**
+(was: its own hand-rolled streak counter directly on `ChordMatcher`, no physics,
+no note-vs-chord distinction). `build_challenges()` still restricts the candidate
+set to the chords being drilled — via `NoteOrChordClassifier(chords)` now, not a
+bare `ChordMatcher(chords)`, so a frame that's honestly a single ringing string
+(weak-fundamental low strings mid-strum, or just getting fingers into position)
+can land on "note", not get forced into whichever drilled chord happens to fit
+best. `on_chroma`/`on_bass` are gone; `on_snapshot` feeds the gate `rms` and
+`series` too, same as Free Detect. `ChordGate` (the older, simpler gate class this
+replaces) had already gone fully unused when Free Detect stopped calling it
+earlier this session — chord practice was its last caller — so it and its tests
+were deleted rather than left as an second, easily-drifting implementation of the
+same idea. One behavioural consequence worth knowing: a fresh chord now needs
+`FRESH_CHORD_FRAMES` (5) agreeing frames to register, not 3 — tests updated to
+match (`test_ui.py::TestChordPracticePanel`, `test_chords.py::TestNoteOrChordGate`).
+
+**A second, real live bug, found and fixed while chasing the above:** in a quiet
+room, an incidental environmental tone (mains hum, a fan/PSU whine — one clean,
+stable frequency) was confidently reported as a played note, on both detection
+paths. Neither existing purity check catches this: a lone pure tone has *nothing
+else* in its spectrum, so `_harmonic_energy_ratio` (YIN) and the chord/note
+template match both score it as if it were maximally clean, precisely because
+there's nothing present to disagree with it. A real plucked string always excites
+more than its fundamental. Two independent fixes, one per detection path, each
+validated against a synthetic lone-tone probe *and* the full real-fixture set
+(regressions here would have been easy to miss, since no existing fixture is a
+"clean room tone" — they're all real notes):
+- **YIN**: `YinDetector._has_second_harmonic` rejects a detection with no real
+  energy at its own 2nd harmonic (`MIN_SECOND_HARMONIC_RATIO`, 0.05). Measured
+  clean separation: pure tones score exactly 0.000 there; the worst real recorded
+  note fixture's confirmed frame scored 0.194; the worst synthesised note anywhere
+  on the neck scored 0.403. `synth.sine()` now adds a small default 2nd harmonic
+  (`second_harmonic=0.15`) so it keeps representing "the simplest clean tone" for
+  every other test that uses it, rather than a signal this check correctly rejects.
+- **Chroma**: `MIN_STRONG_PEAKS` (2) — a frame with fewer than 2 real spectral
+  peaks is treated as no content at all, same as silence. This alone caused a
+  second bug while fixing the first: `PEAK_MAX_FREQ` (the chord-fold's
+  deliberately narrow band, ~500Hz) left a single note whose own 2nd harmonic
+  exceeds it — anything roughly above B4 — with only one visible peak, so
+  `analyse()` started rejecting every high note outright. Fixed by giving
+  `single_series_pitch_class` its *own*, much wider scan (`SERIES_MAX_FREQ`,
+  3000Hz — comfortably past D6's 2nd harmonic, near the top of a 24-fret neck) and
+  fixing `NoteOrChordGate.push`/`AnalysisWorker._process` to check `series`
+  independently of whether the narrow-band `analyse()` succeeded, not gated behind
+  `chroma is not None` — a single high note has nowhere to appear in the
+  chord-tuned fold at all, and that must not also block the (separate, wider)
+  series path. Widening the series band then surfaced a *third* issue: more
+  visible peaks meant more real, legitimate high-harmonic content (a string's 7th
+  partial, "harmonic 7th") that the original chord-tone veto (an allowlist of
+  "safe" harmonic numbers) wrongly rejected, breaking a real E2 recording. Fixed
+  by narrowing the veto to what it actually needs to catch — a natural harmonic
+  series cannot produce a minor third at all, and produces a major third *only* at
+  k=5 (and its octave-doublings, 10, 15, ...), so the veto is now exactly
+  `k % 5 == 0`, not a broader richness judgement. Each of these three fixes was
+  found by watching a real regression appear, not anticipated in advance — the
+  same "diagnose from evidence, not from theory" discipline as the rest of this
+  file. Guarded by `test_pitch.py::TestSecondHarmonicRequirement`,
+  `test_chords.py::TestChromaAnalyser` (lone-tone case),
+  `TestSingleSeriesDetection` (wide-band and k%5 cases), and re-validated against
+  every real chord and note fixture plus the full synthetic neck sweep.
 
 ## Tuned constants
 
@@ -535,8 +593,11 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `FALLBACK_EDGE_MARGIN` | 5 samples from the true array end | `audio/pitch.py` | `test_pitch.py::TestFallbackEdgeRejection` |
 | `CENTER_TOLERANCE_CENTS` | 40 (correct real readings max out at 39c; artifacts start at 43c) | `audio/pitch.py` | `test_pitch.py::TestNoteGateCenterTolerance`, `test_real_recordings.py` |
 | `PEAK_FLOOR` / `PEAK_COMPRESSION` | 0.04 / 0.35 (21/21 real fixtures hold across floor 0.03-0.04, power 0.35-0.40) | `audio/chroma.py` | `test_real_chords.py`, `test_chords.py` |
-| `PEAK_MAX_FREQ` | 500 Hz (covers open-voicing fundamentals up to F#4/G4; above it, h7+ spill feeds X7 templates) | `audio/chroma.py` | `test_real_chords.py` |
-| `SERIES_*` (min f0 62, tol 3%, fraction 0.93, strong-peak 0.10, chord-tone share 0.12) | see docstring | `audio/chroma.py` | `test_chords.py::TestSingleSeriesDetection` |
+| `PEAK_MAX_FREQ` | 500 Hz — the CHORD FOLD band only; deliberately narrow (widening it to solve a note problem reintroduced E/A/D chord confusion) | `audio/chroma.py` | `test_real_chords.py` |
+| `SERIES_MAX_FREQ` | 3000 Hz — single_series_pitch_class's own, separate, much wider band (past D6's 2nd harmonic) | `audio/chroma.py` | `test_chords.py::TestSingleSeriesDetection` |
+| `MIN_STRONG_PEAKS` | 2 (fewer real peaks = no content, same as silence — kills the lone-tone-as-note bug) | `audio/chroma.py` | `test_chords.py::TestChromaAnalyser` |
+| `SERIES_*` (min f0 62, tol 3%, fraction 0.93, strong-peak 0.10, chord-tone share 0.12, veto `k%5==0`) | see docstring | `audio/chroma.py` | `test_chords.py::TestSingleSeriesDetection` |
+| `MIN_SECOND_HARMONIC_RATIO` | 0.05 (pure tones measure 0.000; worst real note fixture 0.194; worst synthetic 0.403) | `audio/pitch.py` | `test_pitch.py::TestSecondHarmonicRequirement` |
 | `GATE_CONFIRM_SCORE` / `GATE_HOLD_SCORE` | 0.75 / 0.5 (attack near-misses 0.6-0.7; settled truth 0.75-0.96; 21/21 holds for confirm 0.72-0.75) | `core/chords.py` | `test_real_chords.py`, `test_chords.py::TestNoteOrChordGate` |
 | `FRESH_CHORD_FRAMES` | 5 (~107ms — the half-formed-strum window) | `core/chords.py` | `test_chords.py::TestNoteOrChordGate` |
 | `GATE_ONSET_FACTOR` | 1.5 (insensitive across at least 1.3-1.8 on real fixtures) | `core/chords.py` | `test_chords.py::TestNoteOrChordGate` |
@@ -548,11 +609,10 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 | `SMOOTHER_ALPHA` / `SMOOTHER_RESET_CENTS` / `SMOOTHER_MEDIAN_WINDOW` | 0.2 / 50 / 3 | `audio/pitch.py` | `test_pitch.py::TestPitchSmoother` |
 | `METER_HOLD_MS` | 700 | `ui/modes.py` | `test_ui.py` (Tuner/FreeDetect hold tests) |
 | debounced save delay | 400ms | `ui/main_window.py` `_mark_dirty` | `test_ui.py::TestSettingsPersistence` |
-| `NoteOrChordGate` `min_score` | 0.35 (well below both real-note ~0.55-0.93 and real-chord ~0.79-0.88 floors; the *comparison* between the two, not this floor, is what discriminates) | `core/chords.py` | `test_chords.py::TestNoteOrChordClassifier` |
 
 ## Testing
 
-861 tests, all passing — including every real-fixture assertion: 24 note
+873 tests, all passing — including every real-fixture assertion: 24 note
 recordings through the YIN path, 9 chord recordings and 12 note recordings through
 the Free Detect chord-recognition path (see the presence-chroma design decision for
 how the chord side went from 0/9 to 9/9). ~15 seconds, no audio hardware and no
@@ -800,7 +860,16 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   mentioned Note Practice failing on an E — that path is YIN-based, its E2 fixture
   passes, and no mechanism for a failure was found there; if it recurs, narrow down
   which string/fret (E3/E4 have never been recorded) and record it.
-- 861 tests, all passing.
+- **Follow-up report, from actually using the app: chord practice mode still used
+  the pre-redesign matcher, and a quiet room's residual mic noise was being
+  confidently reported as played notes.** Both fixed — see the design decisions
+  above (chord practice now shares `NoteOrChordGate` with Free Detect;
+  `MIN_SECOND_HARMONIC_RATIO`/`MIN_STRONG_PEAKS` reject a lone environmental tone
+  on both detection paths). The peak-band-widening fix for the second bug briefly
+  regressed high-note recognition, then a real E2 recording, before landing on the
+  separated-bands + narrowed-veto design documented above — each step validated
+  against the real fixtures before moving on, not assumed safe.
+- 873 tests, all passing.
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -823,12 +892,11 @@ checks that still want a human with an instrument:
 5. **Rhythm mode at 60 BPM through speakers** — the click should now sound clean, not
    distorted or cut off. This was the highest-confidence bug of this batch (the old
    behavior was provably wrong, not just untuned), but hasn't been heard for real yet.
-6. **Chord practice — still on the simpler streak logic (no physics gate), though
-   it now receives the much better presence chroma.** Confirm a strum actually
-   advances the challenge, then check open vs barre voicings and that Am vs C and
-   Em vs G aren't confused. If it feels flaky where Free Detect feels solid, the
-   difference is the missing physics gate — worth a real-fixture pass of its own
-   (see the design decision's known-limitations note).
+6. **Chord practice — now shares Free Detect's physics gate, unverified by ear.**
+   A fresh chord needs 5 agreeing frames (was 3) to register — should still feel
+   prompt, not sluggish. Confirm a strum actually advances the challenge, that a
+   single string plucked while getting into position doesn't get force-matched to
+   the nearest drilled chord, and check open vs barre voicings / Am vs C / Em vs G.
 7. Settings: change a note/chord selection or a toolbar control, quit via Ctrl-C in
    the terminal within a couple seconds, relaunch — it should be remembered.
 8. Rhythm mode: play the correct note/chord well before the beat window ends — the

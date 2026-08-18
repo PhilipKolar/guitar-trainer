@@ -174,10 +174,16 @@ class AnalysisWorker(QObject):
             self.note_released.emit()
 
         chroma = self.chroma.analyse(frame)
-        bass = series = None
+        # bass/series each gate on RMS internally and must not be conditioned on
+        # chroma succeeding: a single note fretted high on the neck has nowhere to
+        # appear in the deliberately narrow chord-tuned fold analyse() uses, so it
+        # legitimately returns None there while single_series_pitch_class (its own,
+        # much wider scan) still finds the note. bass_changed/chroma_updated keep
+        # their existing chroma-gated firing — nothing downstream of those needs
+        # to change for this fix.
+        bass = self.chroma.bass_pitch_class(frame)
+        series = self.chroma.single_series_pitch_class(frame)
         if chroma is not None:
-            bass = self.chroma.bass_pitch_class(frame)
-            series = self.chroma.single_series_pitch_class(frame)
             self.bass_changed.emit(bass)
             self.chroma_updated.emit(chroma)
         self.snapshot_ready.emit(ChromaSnapshot(chroma, bass, series, rms))
