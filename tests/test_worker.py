@@ -5,6 +5,7 @@ worker's thread loop, so they exercise the gating logic without opening a real a
 stream.
 """
 
+import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
@@ -104,6 +105,55 @@ class TestGateWiring:
         quiet = synth.sine(220.0, duration=0.1, amplitude=0.01)[:4096]
         worker._process(quiet, now=0.0)
         assert levels and levels[0] > 0
+
+
+class TestReadWindowSizing:
+    """Regression coverage for a real, previously-undetected bug: run()'s buffer
+    read used to be sized only for the pitch detector (worker.window, 4096
+    samples), but ChromaAnalyser needs at least its own window (8192) or it
+    silently returns None. Every real frame in the running app was starved this
+    way — chroma_updated/bass_changed never fired at all, live, no matter how
+    clean the input was. TestBassOrdering below didn't catch it because it feeds
+    a hand-built 8192-sample frame straight into _process(), bypassing the exact
+    buffer read that was too short. This test performs that same read.
+    """
+
+    def test_read_window_covers_both_analysers(self, qapp):
+        worker = make_worker()
+        assert worker._read_window >= worker.window
+        assert worker._read_window >= worker.chroma.window
+
+    def test_the_actual_run_loop_buffer_read_is_large_enough_for_chroma(self, qapp):
+        worker = make_worker(gate=0.005)
+        midi_notes = [name_to_midi(n) for n in ["E2", "B2", "E3", "G#3", "B3", "E4"]]
+        strum = synth.strum(midi_notes, duration=1.0)
+        worker.capture.buffer.write(strum.astype(np.float32))
+
+        # Exactly what run()'s loop does each iteration — not a hand-picked size.
+        frame = worker.capture.buffer.read_latest(worker._read_window)
+
+        chroma_events = []
+        worker.chroma_updated.connect(chroma_events.append)
+        worker._process(frame, now=0.0)
+
+        assert chroma_events, "chroma never fired from a real run()-style buffer read"
+
+    def test_pitch_detection_is_unaffected_by_chroma_needing_more_history(self, qapp):
+        """The extra history read in for chroma must not change what the pitch
+        detector sees — it should still analyse exactly worker.window samples."""
+        worker = make_worker(gate=0.005)
+        freq = midi_to_freq(name_to_midi("A2"))
+        tone = synth.sine(freq, duration=1.0, amplitude=0.3)
+        worker.capture.buffer.write(tone.astype(np.float32))
+
+        frame = worker.capture.buffer.read_latest(worker._read_window)
+        assert len(frame) > worker.window  # otherwise this test proves nothing
+
+        seen = []
+        worker.frame_analysed.connect(seen.append)
+        worker._process(frame, now=0.0)
+
+        assert seen[0] is not None and seen[0].midi == name_to_midi("A2")
 
 
 class TestBassOrdering:

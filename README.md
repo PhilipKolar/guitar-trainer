@@ -72,20 +72,24 @@ CI.
 ### Testing against your own guitar
 
 Synthesised signals validate the algorithm, but can't catch anything specific to one particular
-instrument, pickup, mic or player. `scripts/record_fixtures.py` records real single notes and
+instrument, pickup, mic or player. `scripts/record_fixtures.py` records real notes or chords and
 checks them into `tests/fixtures/audio/`, so "detection feels erratic" becomes a concrete,
 re-runnable test instead of something to describe in words:
 
 ```bash
-.venv/bin/python -m guitar_trainer.scripts.record_fixtures
+.venv/bin/python -m guitar_trainer.scripts.record_fixtures                # single notes (default)
+.venv/bin/python -m guitar_trainer.scripts.record_fixtures --kind chords  # chords
 ```
 
-Tune with a hardware tuner first. It walks through one chromatic octave on the low E string
-(open through the 11th fret), records a few seconds per note, and shows you what the detector
-made of each take before saving it, so a bad recording can be redone on the spot. Re-running
-`pytest` afterwards exercises every saved clip through the same detector + stability gate the
-app uses (`tests/test_real_recordings.py`) — if a change makes detection worse on your actual
-guitar, this is what catches it. Recording nothing is fine; those tests skip cleanly.
+Tune with a hardware tuner first. `--kind notes` walks through one chromatic octave on the low E
+string (open through the 11th fret); `--kind chords` walks through E, A and D as major, minor and
+dominant seventh (nine chords — any voicing is fine, the matcher isn't fussy about which strings
+you use). Either way it records a few seconds per item and shows you what the detector made of
+each take before saving it, so a bad recording can be redone on the spot. Re-running `pytest`
+afterwards exercises every saved clip through the same detection path the app uses live
+(`tests/test_real_recordings.py` for notes, `tests/test_real_chords.py` for chords) — if a change
+makes detection worse on your actual guitar, this is what catches it. Recording nothing is fine;
+those tests skip cleanly.
 
 ## How it works
 

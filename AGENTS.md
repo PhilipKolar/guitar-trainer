@@ -384,6 +384,52 @@ it, extending the queue if needed; `next()` pops the front. This is what makes t
 independent random draw that might disagree with itself. `SessionEngine.previous` and
 `.upcoming()` expose this to the UI.
 
+**Chord recognition (`chroma_updated`/`bass_changed`) was completely dead in the
+running app — found while extending the real-recording harness to cover chords, not
+by anyone noticing it live.** `AnalysisWorker.run()` read exactly `self.window`
+samples per frame (`DEFAULT_WINDOW`, 4096 — the pitch detector's window) from the
+capture buffer and handed that same frame to both `detector.detect()` *and*
+`self.chroma.analyse()`. `ChromaAnalyser` needs at least its own window (`CHROMA_WINDOW`,
+8192, for low-end frequency resolution on a chord) or `analyse()` returns `None`
+immediately (`if len(frame) < self.window: return None`) — so on every single real
+frame, forever, chroma extraction silently no-opped. `chroma_updated` and
+`bass_changed` never fired live, which meant `FreeDetectPanel`'s note-vs-chord
+classification and `ChordPracticePanel`'s chord scoring never worked no matter what
+was strummed — the exact same class of bug as the dead `set_bass()` wiring below
+(a plausible-looking path with nothing real behind it), except this one had no
+missing *connection* to grep for; the wiring was correct, the buffer read was just
+too short. It went unnoticed because every existing test that needed chroma to fire
+(`test_worker.py::TestBassOrdering`, all of `test_chords.py`) fed a hand-built,
+already-correctly-sized frame straight into `ChromaAnalyser.analyse()` or
+`AnalysisWorker._process()` directly, never exercising `run()`'s actual buffer read.
+Fixed by giving the worker two window notions: `self.window` (4096, unchanged,
+still what the pitch detector sees) and `self._read_window =
+max(self.window, self.chroma.window)` (what's actually read from the buffer each
+frame). `_process()` slices `frame[-self.window:]` for the pitch path so YIN's
+input is byte-for-byte what it always was — tuned constants like the octave-search
+and fallback-edge fixes above assume that exact window, and silently doubling it to
+8192 would have been an unvalidated DSP behaviour change riding along with what was
+supposed to be a pure wiring fix. Regression coverage:
+`test_worker.py::TestReadWindowSizing`, which performs the exact `read_latest()`
+call `run()`'s loop does (not a hand-picked size) and asserts chroma actually fires.
+This is also why `test_real_chords.py` (below) builds its own sliding window as
+`max(DEFAULT_WINDOW, analyser.window)` rather than just `CHROMA_WINDOW` — it's
+deliberately mirroring the real, now-fixed, worker read rather than a convenient one.
+
+**The real-recording harness now covers chords, not just single notes**
+(`scripts/record_fixtures.py --kind chords`, `tests/test_real_chords.py`). E, A and D
+as major, minor and dominant seventh — the first chords most players learn — nine
+fixtures once recorded. The recorder script now covers two "kinds" of item, notes and
+chords, unified behind a small `_Item(heading, filename, check)` so `main()`'s loop
+doesn't need to know which it's holding — a real reduction in duplication, not
+abstraction for its own sake, since the interactive record/sanity-check/keep-or-retry
+loop was previously written twice in spirit. The chord sanity check
+(`sanity_check_chord`) and the pytest harness (`_stable_chord_readings`) both score
+against the *full* chord catalogue (`ChordMatcher()`/`all_chords()`, unrestricted) —
+matching Free Detect, the most demanding real path, rather than a practice session's
+narrowed candidate set, which is easier, not harder. More roots/qualities can be
+added to `CHORD_PLAN` the same way later; nothing else here is specific to these nine.
+
 ## Tuned constants
 
 Changing these has non-obvious consequences; the referenced tests are the safety net.
@@ -413,9 +459,10 @@ Changing these has non-obvious consequences; the referenced tests are the safety
 
 ## Testing
 
-808 tests, all passing (including all 24 real-recording assertions — the five real
-detection bugs the recorded fixtures surfaced have all been fixed), ~12 seconds, no
-audio hardware and no display required.
+827 tests: 825 passing, plus 2 skipped (`test_real_chords.py` — no chord fixtures
+recorded yet, see Status below). All 24 note real-recording assertions pass — the
+five real detection bugs the recorded fixtures surfaced have all been fixed. ~13
+seconds, no audio hardware and no display required.
 
 **Most DSP tests run against synthesised signals** (`tests/synth.py`), which is what
 keeps them deterministic and CI-able. The plucked-string model is the important one: it
@@ -426,18 +473,23 @@ fundamentals, inharmonic partials, attack noise.
 for synthesised tests.** `tests/fixtures/audio/notes/*.wav` — one chromatic octave of
 real guitar notes on the author's actual instrument/mic, played via
 `scripts/record_fixtures.py` and checked by `tests/test_real_recordings.py`.
-Synthesised signals validate the *algorithm* against a model of reality; real
-recordings validate against reality itself, catching whatever's specific to one
-guitar/pickup/room/player that a model can't anticipate (this is exactly the class of
-bug behind "detection feels erratic" — vague reports that a synthetic test couldn't
-reproduce). The empty-fixtures case is still a first-class, tested state (pytest's
-built-in empty-parametrize behaviour turns each into one "skipped" item, not zero items
-and not a failure) — recording is optional, never required to develop, even though a
-full 12-note set now exists (see Status below). If you add a new kind of DSP-affecting
-change, consider whether it's worth asking for a fresh recording pass rather than only
-adding synthetic cases; the synth model doesn't catch everything — it's what caught the
-first real detection bug here (E2 briefly misread as B3) that 168 synthetic tests never
-found, because the failure mode needed the actual harmonic complexity of a real plucked
+`tests/fixtures/audio/chords/*.wav` is the same idea for chords (E/A/D ×
+major/minor/dominant-7th; `--kind chords`; checked by `tests/test_real_chords.py`) —
+none recorded yet as of this writing, so those tests currently skip. Synthesised
+signals validate the *algorithm* against a model of reality; real recordings validate
+against reality itself, catching whatever's specific to one guitar/pickup/room/player
+that a model can't anticipate (this is exactly the class of bug behind "detection
+feels erratic" — vague reports that a synthetic test couldn't reproduce, and, for
+chords, exactly how the dead `chroma_updated` wiring above was actually found — not by
+reasoning about the code, but by extending this harness and asking what it would take
+to make a chord fixture's test meaningful at all). The empty-fixtures case is still a
+first-class, tested state (pytest's built-in empty-parametrize behaviour turns each
+into one "skipped" item, not zero items and not a failure) — recording is optional,
+never required to develop. If you add a new kind of DSP-affecting change, consider
+whether it's worth asking for a fresh recording pass rather than only adding synthetic
+cases; the synth model doesn't catch everything — it's what caught the first real
+detection bug here (E2 briefly misread as B3) that 168 synthetic tests never found,
+because the failure mode needed the actual harmonic complexity of a real plucked
 string, not an idealised model of one.
 
 **When a real recording's test fails, diagnose from the CMND curve before touching
@@ -615,23 +667,33 @@ in response to real usage on the author's machine (very sensitive to speech/typi
   — one chromatic octave, low E string open through fret 11). The first 0.6s of each
   original recording was contaminated by the keyboard tap above; all 12 were trimmed
   in place once the bug was understood, rather than asking for a re-record.
-- This immediately found real bugs no synthetic test had: **all five are now fixed
-  and the full suite passes 808/808.** E2, A#2 and C#3 were detector fixes (see the
-  octave-preference and fallback-edge-rejection design decisions above). D3 and D#3
-  turned out not to be detector bugs at all — the raw readings honestly reported
-  real signal content (a genuine ~73Hz decay resonance the guitar itself produces,
-  confirmed after the room-noise theory was ruled out; and an attack transient that
-  genuinely rings a quarter-tone sharp) — and were fixed in `NoteGate` with two
-  physics rules: no new lower note without new energy (subharmonic-switch onset
-  requirement) and no note event from a pitch parked between two note centers. See
-  the design decision above for the full story, tuning evidence, and the one known
-  accepted limitation (an extremely soft octave pull-off).
+- This immediately found real bugs no synthetic test had: **all five are now fixed.**
+  E2, A#2 and C#3 were detector fixes (see the octave-preference and
+  fallback-edge-rejection design decisions above). D3 and D#3 turned out not to be
+  detector bugs at all — the raw readings honestly reported real signal content (a
+  genuine ~73Hz decay resonance the guitar itself produces, confirmed after the
+  room-noise theory was ruled out; and an attack transient that genuinely rings a
+  quarter-tone sharp) — and were fixed in `NoteGate` with two physics rules: no new
+  lower note without new energy (subharmonic-switch onset requirement) and no note
+  event from a pitch parked between two note centers. See the design decision above
+  for the full story, tuning evidence, and the one known accepted limitation (an
+  extremely soft octave pull-off).
 - Worth a by-ear check on real hardware sometime: during a low note's long decay the
   *live tuner needle* (raw per-frame path through `PitchSmoother`, not `NoteGate`)
   can still briefly show the octave-below wobble that the note-event path now
   suppresses. No test asserts on the raw path; if it bothers in practice, the
   `NoteGate` approach (onset-gated subharmonic suppression) is the template, but the
   smoother is display-only so it may genuinely not matter.
+- **The real-recording harness was extended to chords, and while building it, found
+  that Free Detect chord recognition and chord-practice scoring had never actually
+  worked live at all** — `AnalysisWorker` was reading too few samples per frame for
+  `ChromaAnalyser` to ever produce output, silently, since chroma was introduced. See
+  the design decision above for the full mechanism and fix. This means item 3 and
+  item 6 in the acceptance checks below were previously untestable-as-written (there
+  was nothing working to verify) and are now the most important ones to actually
+  check by ear — everything downstream of chroma is fixed on paper and by test, but
+  genuinely unverified against a real strum until someone does.
+- 827 tests: 825 passing, 2 skipped (no chord fixtures recorded yet).
 
 Still not verified by ear against a real guitar beyond the fixes above. Acceptance
 checks that still want a human with an instrument:
@@ -643,17 +705,25 @@ checks that still want a human with an instrument:
    to do it, not just a normal-volume comment.
 2. Tuner: each open string reads correctly, needle centres when in tune; note holds
    briefly (not abruptly) after a string stops ringing.
-3. **Free detect chord recognition — the specific bug just fixed.** Strum E major
-   repeatedly and confirm it now reads as a chord promptly and consistently, not as a
-   jumping single note. Also try other open chords, and check a genuinely single note
-   still reads as a note (not misclassified as a chord) across the neck.
+3. **Free detect chord recognition — highest priority of this list.** This was
+   *completely dead* until this session (see the design decision on the
+   `AnalysisWorker` window-size bug above) — not degraded, not jumpy, producing
+   zero chord events, ever, no matter what was strummed. Strum E major repeatedly
+   and confirm it now reads as a chord promptly and consistently, not as a jumping
+   single note. Also try other open chords, and check a genuinely single note still
+   reads as a note (not misclassified as a chord) across the neck. Recording real
+   chord fixtures (`--kind chords`) and running `pytest` is the fastest way to check
+   this systematically rather than by ear alone — see `tests/test_real_chords.py`.
 4. Note/chord practice: the Previous/Next preview should feel accurate and useful,
    not distracting; check the fade animation isn't janky on real hardware.
 5. **Rhythm mode at 60 BPM through speakers** — the click should now sound clean, not
    distorted or cut off. This was the highest-confidence bug of this batch (the old
    behavior was provably wrong, not just untuned), but hasn't been heard for real yet.
-6. Chord practice: open vs barre voicings; Am vs C and Em vs G not confused (this now
-   has a real bass-note signal behind it, worth specifically re-checking).
+6. **Chord practice — also affected by the same dead-wiring bug as item 3.** Open vs
+   barre voicings; Am vs C and Em vs G not confused (this has a real bass-note signal
+   behind it). Since `chroma_updated` never fired before this session, no chord was
+   ever scored in practice mode on real hardware — confirm a strum actually advances
+   the challenge at all before worrying about voicing/confusion nuances.
 7. Settings: change a note/chord selection or a toolbar control, quit via Ctrl-C in
    the terminal within a couple seconds, relaunch — it should be remembered.
 8. Rhythm mode: play the correct note/chord well before the beat window ends — the

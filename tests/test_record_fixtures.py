@@ -14,12 +14,15 @@ import pytest
 
 import synth
 from guitar_trainer.audio.capture import AudioCapture
+from guitar_trainer.core.chords import Chord
 from guitar_trainer.core.notes import STANDARD, midi_to_freq, name_to_midi, note_name
 from guitar_trainer.scripts.record_fixtures import (
+    CHORD_PLAN,
     NOTE_PLAN,
     _level_bar,
     record_clip,
     sanity_check,
+    sanity_check_chord,
     save_wav,
 )
 
@@ -130,6 +133,18 @@ class TestNotePlan:
         assert [fret for fret, _ in NOTE_PLAN] == list(range(12))
 
 
+class TestChordPlan:
+    def test_covers_e_a_d_major_minor_and_dominant_seventh(self):
+        assert len(CHORD_PLAN) == 9
+        symbols = {chord.name() for chord in CHORD_PLAN}
+        assert symbols == {"E", "Em", "E7", "A", "Am", "A7", "D", "Dm", "D7"}
+
+    def test_filenames_round_trip_through_chord_parse(self):
+        """The whole fixture scheme relies on filename == chord.name()."""
+        for chord in CHORD_PLAN:
+            assert Chord.parse(chord.name()) == chord
+
+
 class TestWavRoundTrip:
     def test_save_and_load_preserves_the_signal(self, tmp_path):
         original = synth.sine(440.0, duration=0.5, amplitude=0.4)
@@ -181,6 +196,50 @@ class TestSanityCheck:
     def test_silence_is_flagged(self):
         message = sanity_check(np.zeros(48000 * 2, dtype=np.float32), name_to_midi("E2"), 48000)
         assert "no stable note" in message
+
+
+#: Standard open-position voicings for the nine chords CHORD_PLAN covers — the same
+#: shapes a player would actually record. Matches the real voicings used to validate
+#: chord recognition itself in test_chords.py::VOICINGS (plus D7, absent there).
+_CHORD_VOICINGS = {
+    "E": ["E2", "B2", "E3", "G#3", "B3", "E4"],
+    "Em": ["E2", "B2", "E3", "G3", "B3", "E4"],
+    "E7": ["E2", "B2", "D3", "G#3", "B3", "E4"],
+    "A": ["A2", "E3", "A3", "C#4", "E4"],
+    "Am": ["A2", "E3", "A3", "C4", "E4"],
+    "A7": ["A2", "E3", "G3", "C#4", "E4"],
+    "D": ["D3", "A3", "D4", "F#4"],
+    "Dm": ["D3", "A3", "D4", "F4"],
+    "D7": ["D3", "A3", "C4", "F#4"],
+}
+
+
+def _strummed_chord(symbol: str, **kwargs) -> np.ndarray:
+    midi = [name_to_midi(n) for n in _CHORD_VOICINGS[symbol]]
+    return synth.strum(midi, duration=1.5, **kwargs)
+
+
+class TestSanityCheckChord:
+    def test_correct_chord_reads_as_looking_right(self):
+        message = sanity_check_chord(_strummed_chord("E"), Chord.parse("E"), 48000)
+        assert "looks right" in message
+
+    def test_wrong_chord_is_flagged(self):
+        message = sanity_check_chord(_strummed_chord("A"), Chord.parse("E"), 48000)
+        assert "expected E" in message
+        assert "looks right" not in message
+
+    def test_silence_is_flagged(self):
+        message = sanity_check_chord(np.zeros(48000 * 3, dtype=np.float32), Chord.parse("E"), 48000)
+        assert "no stable chord" in message
+
+    @pytest.mark.parametrize("symbol", sorted(_CHORD_VOICINGS))
+    def test_every_planned_chord_reads_correctly_in_its_standard_voicing(self, symbol):
+        """Each of the nine chords CHORD_PLAN covers, played as its standard open
+        voicing, should read as itself — this is what the recorder leans on to flag
+        a bad take on the spot rather than after the whole session."""
+        message = sanity_check_chord(_strummed_chord(symbol), Chord.parse(symbol), 48000)
+        assert "looks right" in message, message
 
 
 class TestLevelBar:

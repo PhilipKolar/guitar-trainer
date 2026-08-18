@@ -50,6 +50,18 @@ class AnalysisWorker(QObject):
         self.detector = YinDetector(sample_rate)
         self.gate = NoteGate()
         self.chroma = ChromaAnalyser(sample_rate)
+        # ChromaAnalyser needs more history than the pitch detector does (its window
+        # is 8192 samples, for low-end frequency resolution on a chord, vs pitch's
+        # 4096) — read enough for whichever analyser needs more, and let _process()
+        # slice back down to `self.window` for the pitch path. Reading only
+        # `self.window` here used to starve chroma.analyse() of samples on every
+        # single frame, so it silently returned None forever: chroma_updated and
+        # bass_changed never fired in the running app, which meant Free Detect's
+        # note-vs-chord classification and chord practice scoring never worked live,
+        # even though both were fully covered by tests that fed hand-built
+        # correctly-sized frames straight into _process() and never exercised this
+        # read. See test_worker.py::TestBassOrdering and AGENTS.md.
+        self._read_window = max(self.window, self.chroma.window)
         self._running = False
         self._suppress_until = 0.0
         self._had_stable_note = False
@@ -104,13 +116,17 @@ class AnalysisWorker(QObject):
                     # rather than spinning through a backlog of stale windows.
                     next_frame = time.monotonic() + interval
 
-                frame = self.capture.buffer.read_latest(self.window)
+                frame = self.capture.buffer.read_latest(self._read_window)
                 self._process(frame, time.monotonic())
         finally:
             self.capture.stop()
 
     def _process(self, frame: np.ndarray, now: float) -> None:
-        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+        # `frame` may carry more history than pitch detection wants (see
+        # _read_window) — trim back down to the tuned pitch window so YIN's behaviour
+        # doesn't silently change with however much extra chroma needs.
+        pitch_frame = frame[-self.window :]
+        rms = float(np.sqrt(np.mean(pitch_frame.astype(np.float64) ** 2)))
         self.level_changed.emit(rms)
 
         if now < self._suppress_until:
@@ -123,7 +139,7 @@ class AnalysisWorker(QObject):
         # keyboard clicks and talking still lit up the tuner needle and note readout
         # no matter how the gate was set.
         result: PitchResult | None = (
-            self.detector.detect(frame) if rms >= self.gate.rms_threshold else None
+            self.detector.detect(pitch_frame) if rms >= self.gate.rms_threshold else None
         )
         self.frame_analysed.emit(result)
 

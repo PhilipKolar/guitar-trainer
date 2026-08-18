@@ -1,34 +1,50 @@
-"""Records real single-note guitar audio into tests/fixtures/audio/notes/.
+"""Records real guitar audio (single notes or chords) into tests/fixtures/audio/.
 
 Synthesised test signals validate the algorithm; they can't catch anything specific
 to a particular guitar, pickup, mic, or player — the exact things behind "detection
-feels erratic" reports. This walks through recording one short clip per note so those
-reports become a concrete, re-runnable pytest assertion instead
-(tests/test_real_recordings.py) — run once, see exactly which note/take is wrong.
+feels erratic" reports. This walks through recording one short clip per note or chord
+so those reports become a concrete, re-runnable pytest assertion instead
+(tests/test_real_recordings.py, tests/test_real_chords.py) — run once, see exactly
+which take is wrong.
 
     python -m guitar_trainer.scripts.record_fixtures [--device N] [--duration 4]
+    python -m guitar_trainer.scripts.record_fixtures --kind chords
 
 Tune the guitar with a hardware tuner first — this script only records and checks
-what it hears against what YIN detects, it doesn't verify intonation.
+what it hears against what the app's own detector reports, it doesn't verify
+intonation.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from ..audio.capture import DEFAULT_SAMPLE_RATE, AudioCapture, list_input_devices
-from ..audio.pitch import DEFAULT_WINDOW, NoteGate, YinDetector
+from ..audio.chroma import ChromaAnalyser
+from ..audio.pitch import DEFAULT_HOP, DEFAULT_WINDOW, NoteGate, YinDetector
+from ..core.chords import Chord, ChordGate, ChordMatcher
 from ..core.notes import STANDARD, note_name
 
 #: One full chromatic octave, played on a single string (frets 0-11 on the low E) so
 #: there's no string-to-string jump to get wrong while recording.
 NOTE_PLAN = [(fret, STANDARD.midi_at(0, fret)) for fret in range(12)]
 
-FIXTURES_DIR = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "audio" / "notes"
+#: The first chords most players learn: E, A and D, each as a major triad, minor
+#: triad and dominant seventh. More roots/qualities can be added to this list the
+#: same way later — nothing else here is specific to these nine.
+CHORD_PLAN = [Chord.parse(s) for s in ("E", "Em", "E7", "A", "Am", "A7", "D", "Dm", "D7")]
+
+_QUALITY_LABEL = {"maj": "major", "min": "minor", "7": "dominant 7th"}
+
+FIXTURES_ROOT = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "audio"
+NOTES_FIXTURES_DIR = FIXTURES_ROOT / "notes"
+CHORDS_FIXTURES_DIR = FIXTURES_ROOT / "chords"
 
 
 def _load_wavfile():
@@ -96,16 +112,87 @@ def sanity_check(samples: np.ndarray, expected_midi: int, sample_rate: int) -> s
     return f"detected {settled.name} ({settled.cents:+.0f}¢) — looks right"
 
 
+def sanity_check_chord(samples: np.ndarray, expected: Chord, sample_rate: int) -> str:
+    """Run the take through the real chord-detection path — chroma extraction plus
+    matching against every chord, not just the one expected, so a take that actually
+    reads as some *other* chord is caught right away rather than reported as a vague
+    "not this one". Scored against the full catalogue (``ChordMatcher()`` with no
+    restriction) to mirror Free Detect, the most demanding real path — a practice
+    session narrows the candidates, which is easier, not harder.
+    """
+    analyser = ChromaAnalyser(sample_rate)
+    gate = ChordGate(ChordMatcher())
+    window = max(DEFAULT_WINDOW, analyser.window)
+    settled = None
+    for start in range(0, len(samples) - window, DEFAULT_HOP):
+        frame = samples[start : start + window]
+        chroma = analyser.analyse(frame)
+        bass = analyser.bass_pitch_class(frame) if chroma is not None else None
+        stable = gate.push(chroma, bass)
+        if stable is not None:
+            settled = stable
+
+    if settled is None:
+        return "no stable chord detected — too quiet, ambiguous, or didn't settle in time"
+    if settled.chord != expected:
+        return f"detected {settled.chord.name()} (score {settled.score:.2f}) — expected {expected.name()}"
+    return f"detected {settled.chord.name()} (score {settled.score:.2f}, margin {settled.margin:.2f}) — looks right"
+
+
+@dataclass(frozen=True)
+class _Item:
+    """One thing to record: a prompt to show, the filename to save under, and how
+    to sanity-check the take. Notes and chords differ only in how these are built —
+    the recording loop in main() doesn't need to know which it's holding."""
+
+    heading: str
+    filename: str
+    check: Callable[[np.ndarray, int], str]
+
+
+def _note_items(plan) -> list[_Item]:
+    items = []
+    for fret, midi in plan:
+        name = note_name(midi)
+        where = "open string" if fret == 0 else f"fret {fret}"
+        items.append(
+            _Item(
+                heading=f"{name} — low E string, {where}",
+                filename=f"{name}.wav",
+                check=lambda samples, sr, midi=midi: sanity_check(samples, midi, sr),
+            )
+        )
+    return items
+
+
+def _chord_items(plan) -> list[_Item]:
+    items = []
+    for chord in plan:
+        symbol = chord.name()
+        items.append(
+            _Item(
+                heading=f"{symbol} ({_QUALITY_LABEL[chord.quality]}) — strum it, any voicing, let it ring",
+                filename=f"{symbol}.wav",
+                check=lambda samples, sr, chord=chord: sanity_check_chord(samples, chord, sr),
+            )
+        )
+    return items
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=None, help="input device index")
     parser.add_argument("--list", action="store_true", help="list input devices and exit")
     parser.add_argument("--duration", type=float, default=4.0, help="seconds per clip (default 4)")
     parser.add_argument(
-        "--force", action="store_true", help="re-record notes that already have a saved clip"
+        "--kind", choices=("notes", "chords"), default="notes", help="what to record (default notes)"
     )
     parser.add_argument(
-        "--out", type=Path, default=FIXTURES_DIR, help=f"output directory (default {FIXTURES_DIR})"
+        "--force", action="store_true", help="re-record items that already have a saved clip"
+    )
+    parser.add_argument(
+        "--out", type=Path, default=None,
+        help="output directory (default tests/fixtures/audio/<kind>)",
     )
     args = parser.parse_args()
 
@@ -121,12 +208,19 @@ def main() -> int:
         print("No input devices found. Is PortAudio installed (libportaudio2)?")
         return 1
 
-    plan = [
-        (fret, midi) for fret, midi in NOTE_PLAN
-        if args.force or not (args.out / f"{note_name(midi)}.wav").exists()
-    ]
+    if args.kind == "chords":
+        all_items = _chord_items(CHORD_PLAN)
+        default_out = CHORDS_FIXTURES_DIR
+        noun = "chord"
+    else:
+        all_items = _note_items(NOTE_PLAN)
+        default_out = NOTES_FIXTURES_DIR
+        noun = "note"
+    out = args.out if args.out is not None else default_out
+
+    plan = [item for item in all_items if args.force or not (out / item.filename).exists()]
     if not plan:
-        print(f"All {len(NOTE_PLAN)} notes already recorded in {args.out}. Use --force to redo them.")
+        print(f"All {len(all_items)} {noun}s already recorded in {out}. Use --force to redo them.")
         return 0
 
     # The ring buffer must hold at least one full clip — its default (~1.4s, sized for
@@ -143,27 +237,25 @@ def main() -> int:
         print(f"Could not open the input stream: {exc}")
         return 1
 
-    print(f"Recording {len(plan)} note(s) to {args.out}")
+    print(f"Recording {len(plan)} {noun}(s) to {out}")
     print("Tune with a hardware tuner first — this only checks pitch, not intonation.\n")
 
     try:
         with capture:
-            for i, (fret, midi) in enumerate(plan, 1):
-                name = note_name(midi)
-                where = "open string" if fret == 0 else f"fret {fret}"
-                print(f"[{i}/{len(plan)}] {name} — low E string, {where}")
+            for i, item in enumerate(plan, 1):
+                print(f"[{i}/{len(plan)}] {item.heading}")
 
                 while True:
                     input("  Press Enter to start recording, or Ctrl-C to stop early...")
                     samples = record_clip(capture, args.duration, DEFAULT_SAMPLE_RATE)
-                    print(f"  {sanity_check(samples, midi, DEFAULT_SAMPLE_RATE)}")
+                    print(f"  {item.check(samples, DEFAULT_SAMPLE_RATE)}")
                     choice = input("  Keep this take? [Y/n] ").strip().lower()
                     if choice in ("", "y", "yes"):
                         break
                     print("  Retrying...")
 
-                save_wav(args.out / f"{name}.wav", samples, DEFAULT_SAMPLE_RATE)
-                print(f"  Saved {name}.wav\n")
+                save_wav(out / item.filename, samples, DEFAULT_SAMPLE_RATE)
+                print(f"  Saved {item.filename}\n")
     except KeyboardInterrupt:
         print("\nStopped early — clips saved so far are kept.")
 
